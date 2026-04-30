@@ -1,0 +1,1727 @@
+; editor.anc — buged text editor in Anchor
+;
+; Memory layout:
+;   gap buffer data   — malloc/realloc'd, grows as needed
+;   g-tios / g-winsz  — static allocations (global)
+;   g-out             — 256 KB static output buffer, flushed each render
+;   g-fname           — 4 KB static file-name buffer
+;   g-undo-data       — 512 KB static pool for undo byte storage
+;   g-undo-ring       — static array of undo entries (up to 4096)
+;   everything else   — plain globals (integers)
+;
+; Platform: macOS (constants and struct layouts hardcoded for 64-bit macOS)
+
+; ---------------------------------------------------------------------------
+; Macros
+; ---------------------------------------------------------------------------
+
+; define-api: generate struct (all fields 8-byte) + populate-Name function
+(define-syntax define-api
+  (macro-case ()
+    [(_ name (field impl) ...)
+     (let ([pop (datum->syntax name
+                  (string->symbol
+                    (string-append "populate-"
+                      (symbol->string (id-sym name)))))])
+       `(do
+          (struct ,name ,@(map (lambda (f) `(,f 8)) field))
+          (fn ,pop (_api-ptr)
+            ,@(map (lambda (f i) `(set! _api-ptr ,name ,f (fn-ptr ,i))) field impl))))]))
+
+; out-lit: write string literal to output buffer (computes length at compile time)
+(define-syntax out-lit
+  (macro-case ()
+    [(_ s) `(out-bytes ,s ,(string-length s))]))
+
+; cpy-lit: memcpy string literal including null terminator
+(define-syntax cpy-lit
+  (macro-case ()
+    [(_ dst s) `(memcpy ,dst ,s ,(+ (string-length s) 1))]))
+
+(define-syntax when
+  (syntax-rules () [(_ c b ...) (if c (do b ...))]))
+
+(define-syntax unless
+  (syntax-rules () [(_ c b ...) (if (! c) (do b ...))]))
+
+(define-syntax inc!
+  (syntax-rules () [(_ x) (set! x (+ x 1))]))
+
+(define-syntax dec!
+  (syntax-rules () [(_ x) (set! x (- x 1))]))
+
+(define-syntax inc-by!
+  (syntax-rules () [(_ x n) (set! x (+ x n))]))
+
+(define-syntax dec-by!
+  (syntax-rules () [(_ x n) (set! x (- x n))]))
+
+(fn min2 (a b) (if (< a b) (return a) (return b)))
+(fn max2 (a b) (if (> a b) (return a) (return b)))
+(fn abs2 (x) (if (< x 0) (return (- 0 x)) (return x)))
+
+(fn repeat-move (pos f n)
+  (let i pos) (let c n)
+  (while (> c 0) (set! i (call-ptr f i)) (dec! c))
+  (return i))
+
+(define-syntax skip-gap!
+  (macro-case ()
+    [(_ p) `(when (&& (>= ,p g-gap-start) (< ,p g-gap-end)) (set! ,p g-gap-end))]))
+
+(fn col-width (cp) (if (== cp #\tab) (return g-tab-size) (return (char-width cp))))
+
+(define-syntax advance-pos!
+  (macro-case ()
+    [(_ row col cp w)
+     `(if (== ,cp #\newline)
+        (do (inc! ,row) (set! ,col 0))
+        (do (inc-by! ,col ,w)
+            (when (>= ,col g-cols) (inc! ,row) (set! ,col (% ,col g-cols)))))]))
+
+
+; ---------------------------------------------------------------------------
+; FFI declarations
+; ---------------------------------------------------------------------------
+
+(include <stdio.h>)
+(include <stdlib.h>)
+(include <unistd.h>)
+(include <termios.h>)
+(include <sys/ioctl.h>)
+(include <poll.h>)
+(include <signal.h>)
+(include <locale.h>)
+(include <wchar.h>)
+(include <dlfcn.h>)
+
+(ffi tcgetattr  (int void*)                 -> int)
+(ffi tcsetattr  (int int void*)             -> int)
+(ffi ioctl      (int size_t void*)          -> int)
+(ffi setlocale  (int char*)                 -> char*)
+(ffi wcwidth    (int)                       -> int)
+(ffi signal     (int void*)                 -> void*)
+(ffi kill       (int int)                   -> int)
+(ffi getpid     ()                          -> int)
+(ffi read       (int void* size_t)          -> int)
+(ffi write      (int void* size_t)          -> int)
+(ffi malloc     (size_t)                    -> char*)
+(ffi realloc    (void* size_t)              -> char*)
+(ffi free       (void*))
+(ffi memmove    (void* void* size_t)        -> void*)
+(ffi memcpy     (void* void* size_t)        -> void*)
+(ffi popen      (char* char*)               -> void*)
+(ffi pclose     (void*)                     -> int)
+(ffi fread      (void* size_t size_t void*) -> size_t)
+(ffi fwrite     (void* size_t size_t void*) -> size_t)
+(ffi feof       (void*)                     -> int)
+(ffi fgetc      (void*)                     -> int)
+(ffi fopen      (char* char*)               -> void*)
+(ffi fclose     (void*)                     -> int)
+(ffi fileno     (void*)                     -> int)
+(ffi fseek      (void* long int)            -> int)
+(ffi ftell      (void*)                     -> long)
+(ffi poll       (void* long int)            -> int)
+(ffi getenv     (char*)                     -> char*)
+(ffi strlen     (char*)                     -> size_t)
+(ffi memset     (void* int size_t)          -> void*)
+(ffi dlopen     (char* int)                 -> void*)
+(ffi dlsym      (void* char*)               -> void*)
+(ffi dlclose    (void*)                     -> int)
+
+; ---------------------------------------------------------------------------
+; Struct definitions
+; ---------------------------------------------------------------------------
+
+; macOS termios (64-bit, unpacked = natural alignment): total 72 bytes
+; c_iflag(8) c_oflag(8) c_cflag(8) c_lflag(8) c_cc[20](20) [pad4] c_ispeed(8) c_ospeed(8)
+(unpacked-struct TermIos
+  (iflag  8)
+  (oflag  8)
+  (cflag  8)
+  (lflag  8)
+  (cc     20)
+  (ispeed 8)
+  (ospeed 8))
+
+; macOS winsize: total 8 bytes
+(unpacked-struct WinSize
+  (rows 2)
+  (cols 2)
+  (xpix 2)
+  (ypix 2))
+
+; poll(2) struct: total 8 bytes
+(unpacked-struct PollFd
+  (fd     4)
+  (events 2)
+  (revents 2))
+
+; Undo entry: 32 bytes
+(struct UndoEntry
+  (pos       8)   ; gap-start at time of action
+  (type      8)   ; 0=insert(undo=delete n), 1=delete(undo=insert bytes)
+  (data-off  8)   ; byte offset into g-undo-data pool (type=1 only)
+  (len       8))  ; char count (type=0) or byte count (type=1)
+
+; Editor API exposed to config .dylib — function pointers for plugin callbacks
+(define-api EditorAPI
+  ;; State getters (0-arg)
+  (get-data-ptr    api-get-data-ptr)
+  (get-gap-start   api-get-gap-start)
+  (get-gap-end     api-get-gap-end)
+  (get-buf-size    api-get-buf-size)
+  (get-view-start  api-get-view-start)
+  (get-mark        api-get-mark)
+  (get-cols        api-get-cols)
+  (get-rows        api-get-rows)
+  (get-tab-size    api-get-tab-size)
+  (get-file-type   api-get-file-type)
+  ;; Buffer navigation (1-arg)
+  (do-gbyte        gbyte)
+  (do-utf8-ref     utf8-ref-phys)
+  (do-fwd-char     fwd-char)
+  (do-back-char    back-char)
+  (do-line-start   line-start)
+  (do-col-width    api-col-width)
+  ;; Mutators
+  (do-set-color    set-color)
+  (do-set-tab-size api-set-tab-size)
+  (do-set-hl-color api-set-hl-color)
+  (do-set-bg-color api-set-bg-color)
+  (do-set-text-color api-set-text-color)
+  (do-ins-char     api-ins-char)
+  (do-ins-spaces   api-ins-spaces)
+  (do-gap-move     api-gap-move)
+  (do-render       api-render)
+  (do-write-file   api-write-file)
+  (do-undo-push-ins api-undo-push-ins)
+  ;; Callback registration
+  (reg-draw-start  api-reg-draw-start)
+  (reg-draw-char   api-reg-draw-char)
+  (reg-draw-end    api-reg-draw-end)
+  (reg-on-key      api-reg-on-key)
+  (reg-on-newline  api-reg-on-newline)
+  (reg-compute-vs  api-reg-compute-vs))
+
+; Single-byte and word access helpers
+
+; ---------------------------------------------------------------------------
+; Static global state
+; ---------------------------------------------------------------------------
+
+; Terminal saved/raw termios and winsize (static storage)
+(global g-tios    (alloc 80))   ; saved termios (>= 72 bytes)
+(global g-raw-tios (alloc 80))  ; raw-mode termios
+(global g-winsz   (alloc 8))
+(global g-pfd     (alloc 8))    ; PollFd for escape-sequence peek
+
+; Output buffer flushed each render frame
+(global g-out      (alloc (kb 256)))
+(global g-out-len  0)
+
+; File name
+(global g-fname     (alloc (kb 4)))
+(global g-fname-len 0)
+
+; Gap buffer (data is malloc'd; all other fields are plain globals)
+(global g-data       0)   ; raw pointer stored as integer (via malloc)
+(global g-gap-start  0)
+(global g-gap-end    0)
+(global g-buf-size   0)
+(const  INIT-GAP     1024)
+
+; Undo ring — circular buffer with three pointers:
+;   oldest → top = valid entries, point = undo read head
+; Data pool is linear; when full, evict oldest entries until room.
+(global g-undo-ring  (alloc (kb 128)))  ; 4096 entries × 32 bytes
+(global g-undo-data  (alloc (kb 512)))  ; pool for deleted bytes
+(global g-undo-top     0)              ; write head — next slot to write
+(global g-undo-point   0)              ; read head — next slot to undo
+(global g-undo-oldest  0)              ; oldest valid entry
+(global g-undo-pool-top 0)             ; next byte in g-undo-data
+(global g-undoing      0)              ; 1 during undo — prevents point reset
+(const  UNDO-CAP       4096)
+(const  UNDO-DATA-CAP  524288)  ; 512 KB
+
+; Screen state
+(global g-rows    24)
+(global g-cols    80)
+(global g-view-start 0)
+(global g-mark    -1)      ; -1 = no mark
+(global g-clicked-y -1)
+(global g-clicked-x -1)
+(global g-cursor-row 0)
+(global g-cursor-col 0)
+(global g-resized 0)
+
+; Editor settings (user-configurable via config .so)
+(global g-tab-size   4)
+(global g-hl-color   47)   ; ANSI: white bg (selection)
+(global g-bg-color   49)   ; ANSI: default bg
+(global g-text-color 39)   ; ANSI: default fg
+(global g-file-type  0)    ; 0=none 1=scheme 2=c
+(global g-search-buf (alloc 4096))
+(global g-search-len 0)
+
+; Config .dylib
+(global g-config-api (alloc (sizeof EditorAPI)))
+(global g-config-handle 0)         ; dlopen handle
+
+; Plugin callbacks (set by config via API registration)
+(global g-cb-draw-start  0)
+(global g-cb-draw-char   0)
+(global g-cb-draw-end    0)
+(global g-cb-on-key      0)
+(global g-cb-on-newline  0)
+(global g-cb-compute-vs  0)
+
+; View state for syntax highlighting (0=none, 1=string, 2=block-comment)
+(global g-view-state     0)
+
+; 1-byte read buffer — reused by read-byte to avoid arena growth per keystroke
+(global g-read1 (alloc 1))
+
+; ---------------------------------------------------------------------------
+; SIGWINCH handler (fn-c = C calling convention, callable by signal())
+; ---------------------------------------------------------------------------
+
+(fn-c sigwinch-handler ((int sig)) -> void
+  (global-set! g-resized 1))
+
+; ---------------------------------------------------------------------------
+; Output buffer helpers
+; ---------------------------------------------------------------------------
+
+(fn out-byte (b)
+  (set! g-out g-out-len 1 b)
+  (inc! g-out-len))
+
+(fn out-bytes (src n)
+  (memmove (+ g-out g-out-len) src n)
+  (inc-by! g-out-len n))
+
+; Write non-negative integer n into output buffer
+(fn out-int (n)
+  (if (== n 0)
+    (out-byte #\0)
+    (do
+      (let start g-out-len)
+      (let nn n)
+      (while (> nn 0)
+        (out-byte (+ #\0 (% nn 10)))
+        (set! nn (/ nn 10)))
+      ; reverse digits written above
+      (let i start)
+      (let j (- g-out-len 1))
+      (while (< i j)
+        (let tmp (get g-out i 1))
+        (set! g-out i 1 (get g-out j 1))
+        (set! g-out j 1 tmp)
+        (inc! i)
+        (dec! j)))))
+
+; ESC[
+(fn out-esc ()
+  (out-byte #\esc)
+  (out-byte #\[))
+
+(fn flush-out ()
+  (write (c-const STDOUT_FILENO)g-out g-out-len)
+  (global-set! g-out-len 0))
+
+; ---------------------------------------------------------------------------
+; Screen commands
+; ---------------------------------------------------------------------------
+
+(fn screen-alt-on  () (out-lit "\x1b[?1049h"))
+(fn screen-alt-off () (out-lit "\x1b[?1049l"))
+(fn hide-cursor    () (out-lit "\x1b[?25l"))
+(fn show-cursor    () (out-lit "\x1b[?25h"))
+
+; ESC[row;colH  (1-based)
+(fn move-cursor (row col)
+  (out-esc)
+  (out-int row)
+  (out-byte #\;)
+  (out-int col)
+  (out-byte #\H))
+
+; ESC[Nm  (set color attribute)
+(fn set-color (n)
+  (out-esc)
+  (out-int n)
+  (out-byte #\m))
+
+; ESC[bg;fgm  (set bg and fg color together)
+(fn set-color2 (bg fg)
+  (out-esc)
+  (out-int bg)
+  (out-byte #\;)
+  (out-int fg)
+  (out-byte #\m))
+
+; Mouse tracking on/off
+(fn mouse-on ()
+  (out-lit "\x1b[?1002h")    ; button motion
+  (out-lit "\x1b[?1006h"))  ; SGR
+
+(fn mouse-off ()
+  (out-lit "\x1b[?1002l")
+  (out-lit "\x1b[?1006l"))
+
+; ---------------------------------------------------------------------------
+; Terminal raw mode
+; ---------------------------------------------------------------------------
+
+(fn term-raw-on ()
+  ; Save current settings
+  (tcgetattr (c-const STDIN_FILENO)g-tios)
+  ; Copy to raw buffer and modify
+  (memcpy g-raw-tios g-tios 80)
+  ; lflag: clear ECHO|ICANON|ISIG|IEXTEN
+  (let lf (get g-raw-tios TermIos lflag))
+  (set! g-raw-tios TermIos lflag
+        (band lf (bnot (bor (c-const ECHO)
+                       (bor (c-const ICANON)
+                       (bor (c-const ISIG)
+                            (c-const IEXTEN)))))))
+  ; iflag: clear IXON|ICRNL (ICRNL translates CR→LF, must disable for raw Enter)
+  (let iff (get g-raw-tios TermIos iflag))
+  (set! g-raw-tios TermIos iflag
+        (band iff (bnot (bor (c-const IXON) (c-const ICRNL)))))
+  ; oflag: clear OPOST
+  (let of (get g-raw-tios TermIos oflag))
+  (set! g-raw-tios TermIos oflag (band of (bnot (c-const OPOST))))
+  ; c_cc: VMIN=1 VTIME=0
+  (let cc (aref g-raw-tios TermIos cc))
+  (set! cc (c-const VMIN)  1 1)
+  (set! cc (c-const VTIME) 1 0)
+  (tcsetattr (c-const STDIN_FILENO)(c-const TCSAFLUSH) g-raw-tios))
+
+(fn term-raw-off ()
+  (tcsetattr (c-const STDIN_FILENO)(c-const TCSAFLUSH) g-tios))
+
+(fn term-get-size ()
+  (ioctl (c-const STDOUT_FILENO)(c-const TIOCGWINSZ) g-winsz)
+  (global-set! g-rows (get g-winsz WinSize rows))
+  (global-set! g-cols (get g-winsz WinSize cols)))
+
+; ---------------------------------------------------------------------------
+; View-start conversions (g-view-start is LOGICAL, like Scheme)
+;   cwgs: logical → physical (for reading buffer content from view-start)
+;   bound-idx: physical → logical (for storing into g-view-start)
+; ---------------------------------------------------------------------------
+
+(fn cwgs (vs) (if (>= vs g-gap-start) (return g-gap-end) (return vs)))
+(fn bound-idx (pos) (if (>= pos g-gap-end) (return (- pos (- g-gap-end g-gap-start))) (return pos)))
+
+; ---------------------------------------------------------------------------
+; Gap buffer — data is malloc'd, grows via realloc
+; ---------------------------------------------------------------------------
+
+; Read raw byte from gap data at absolute index i
+(fn gbyte (i)
+  (return (get g-data i 1)))
+
+; Write raw byte b to gap data at absolute index i
+(fn gbyte! (i b)
+  (set! g-data i 1 b))
+
+; Move gap so that gap-start = target (target is a PHYSICAL byte position)
+; If target lands inside gap [gap-start, gap-end), treat as gap-end (first post-gap pos)
+(fn gap-move (target)
+  ; Normalize: if target is inside the gap (but not at gap-start), snap to gap-end
+  (let t target)
+  (when (&& (> t g-gap-start) (< t g-gap-end))
+    (set! t g-gap-end))
+  (when (< t g-gap-start)
+    (let dis (- g-gap-start t))
+    (dec-by! g-gap-end dis)
+    (dec-by! g-gap-start dis)
+    (memmove (+ g-data g-gap-end)
+             (+ g-data g-gap-start)
+             dis))
+  (when (> t g-gap-end)
+    (let dis (- t g-gap-end))
+    (memmove (+ g-data g-gap-start)
+             (+ g-data g-gap-end)
+             dis)
+    (inc-by! g-gap-start dis)
+    (inc-by! g-gap-end dis)))
+
+; Grow gap buffer by INIT-GAP bytes
+(fn gap-grow ()
+  (let new-size (+ g-buf-size INIT-GAP))
+  (let new-end  (+ g-gap-end INIT-GAP))
+  (let tail-len (- g-buf-size g-gap-end))
+  (let new-data (realloc g-data new-size))
+  (global-set! g-data new-data)
+  (memmove (+ g-data new-end)
+           (+ g-data g-gap-end)
+           tail-len)
+  (global-set! g-gap-end new-end)
+  (global-set! g-buf-size new-size))
+
+; Whitespace test (space, newline, tab)
+(fn ws? (cp) (return (|| (== cp #\space) (|| (== cp #\newline) (== cp #\tab)))))
+
+; ---------------------------------------------------------------------------
+; UTF-8 helpers
+; ---------------------------------------------------------------------------
+
+; Number of bytes in the UTF-8 char starting with byte b
+(fn utf8-size (b)
+  (return (if (== (band b 0x80) 0)    1
+          (if (== (band b 0xE0) 0xC0) 2
+          (if (== (band b 0xF0) 0xE0) 3
+                                       4)))))
+
+; Read codepoint at physical position i; return codepoint
+(fn utf8-ref-phys (i)
+  (let b (gbyte i))
+  (return (if (== (band b 0x80) 0)
+    b
+  (if (== (band b 0xE0) 0xC0)
+    (bor (lshift (band b 0x1F) 6)
+         (band (gbyte (+ i 1)) 0x3F))
+  (if (== (band b 0xF0) 0xE0)
+    (bor (lshift (band b 0x0F) 12)
+    (bor (lshift (band (gbyte (+ i 1)) 0x3F) 6)
+         (band (gbyte (+ i 2)) 0x3F)))
+  ; 4-byte
+  (bor (lshift (band b 0x07) 18)
+  (bor (lshift (band (gbyte (+ i 1)) 0x3F) 12)
+  (bor (lshift (band (gbyte (+ i 2)) 0x3F) 6)
+       (band (gbyte (+ i 3)) 0x3F)))))))))
+
+; Write codepoint cp at physical position i; return bytes written
+(fn utf8-write-phys (i cp)
+  (if (< cp 0x80)
+    (do (gbyte! i cp) (return 1))
+  (if (< cp 0x800)
+    (do (gbyte! i      (bor 0xC0 (rshift cp 6)))
+        (gbyte! (+ i 1) (bor 0x80 (band cp 0x3F)))
+        (return 2))
+  (if (< cp 0x10000)
+    (do (gbyte! i      (bor 0xE0 (rshift cp 12)))
+        (gbyte! (+ i 1) (bor 0x80 (band (rshift cp 6) 0x3F)))
+        (gbyte! (+ i 2) (bor 0x80 (band cp 0x3F)))
+        (return 3))
+  (do   (gbyte! i      (bor 0xF0 (rshift cp 18)))
+        (gbyte! (+ i 1) (bor 0x80 (band (rshift cp 12) 0x3F)))
+        (gbyte! (+ i 2) (bor 0x80 (band (rshift cp 6) 0x3F)))
+        (gbyte! (+ i 3) (bor 0x80 (band cp 0x3F)))
+        (return 4))))))
+
+
+; Display width of codepoint cp (tab = tab-size spaces)
+(fn char-width (cp)
+  (if (== cp #\tab)
+    (return g-tab-size)
+    (do
+      (let w (wcwidth cp))
+      (return (if (< w 0) 1 w)))))
+
+; Move backward one physical char from idx (skips gap correctly)
+(fn back-char (idx)
+  (let loop-i (- idx 1))
+  (while (>= loop-i 0)
+    ; jump over gap going backward: if we land inside [gap-start,gap-end), go to gap-start-1
+    (when (&& (>= loop-i g-gap-start) (< loop-i g-gap-end))
+      (set! loop-i (- g-gap-start 1)))
+    (when (< loop-i 0) (return 0))
+    (let b (gbyte loop-i))
+    (when (!= (band b 0xC0) 0x80)   ; not a continuation byte → start of char
+      (return loop-i))
+    (dec! loop-i))
+  (return 0))
+
+; Move forward one physical char from idx (skips gap correctly)
+(fn fwd-char (idx)
+  (when (>= idx g-buf-size) (return idx))
+  (let sz (utf8-size (gbyte idx)))
+  (let next (+ idx sz))
+  ; if new position enters gap, jump to gap-end (matching Scheme forward-char)
+  (return (if (&& (>= next g-gap-start) (< idx g-gap-start))
+    g-gap-end
+    next)))
+
+; Line start — scan backward for newline (physical positions)
+(fn line-start (idx)
+  (let i idx)
+  (while (> i 0)
+    (let prev (back-char i))
+    ; prev==0 and inside gap means nothing before cursor
+    (when (&& (>= prev g-gap-start) (< prev g-gap-end)) (return i))
+    (when (== (utf8-ref-phys prev) #\newline) (return i))
+    (when (== prev 0)
+      (when (!= (utf8-ref-phys 0) #\newline) (return 0))
+      (return i))
+    (set! i prev))
+  (return 0))
+
+; Line end — scan forward for newline or buf end (physical positions)
+(fn line-end (idx)
+  (let p idx)
+  (skip-gap! p)
+  (while (&& (< p g-buf-size) (!= (gbyte p) #\newline))
+    (inc-by! p (utf8-size (gbyte p)))
+    (skip-gap! p))
+  (return p))
+
+; Move up one display line from physical position idx
+(fn move-up (idx)
+  (let ls (line-start idx))
+  (let target-col 0)
+  (let li ls)
+  (while (< li idx)
+    (inc-by! target-col (col-width (utf8-ref-phys li)))
+    (set! li (fwd-char li)))
+  (let prev-line-end (back-char ls))
+  (when (== prev-line-end 0)
+    (when (&& (> g-gap-start 0) (== ls g-gap-end)) (return 0))
+    (when (== ls 0) (return 0)))
+  ; guard: if prev-line-end is inside gap, we're at top
+  (when (&& (>= prev-line-end g-gap-start) (< prev-line-end g-gap-end)) (return 0))
+  (let prev-ls (line-start prev-line-end))
+  (let pos prev-ls)
+  (let c 0)
+  (while (&& (< pos prev-line-end) (< c target-col))
+    (let cp (utf8-ref-phys pos))
+    (when (== cp #\newline) (return pos))
+    (inc-by! c (col-width cp))
+    (set! pos (fwd-char pos)))
+  (return pos))
+
+; Move down one display line (physical positions)
+(fn move-down (idx)
+  (let target-col 0)
+  (let ls (line-start idx))
+  (let li ls)
+  (while (< li idx)
+    (inc-by! target-col (col-width (utf8-ref-phys li)))
+    (set! li (fwd-char li)))
+  (let le (line-end idx))
+  (let next-ls (fwd-char le))
+  (when (>= next-ls g-buf-size) (return idx))
+  (let pos next-ls)
+  (let c 0)
+  (while (&& (< pos g-buf-size) (< c target-col))
+    (let cp (utf8-ref-phys pos))
+    (when (== cp #\newline) (return pos))
+    (inc-by! c (col-width cp))
+    (set! pos (fwd-char pos)))
+  (return pos))
+
+; Word backward (physical positions)
+(fn back-word (idx)
+  (let i (back-char idx))
+  (while (> i 0)
+    (let cp   (utf8-ref-phys i))
+    (let prev (back-char i))
+    ; guard: prev in gap means at buffer start
+    (when (&& (>= prev g-gap-start) (< prev g-gap-end)) (return i))
+    (let pcp  (utf8-ref-phys prev))
+    (when (&& (! (ws? cp)) (ws? pcp))
+      (return i))
+    (set! i prev))
+  (return 0))
+
+; Word forward (physical positions)
+(fn fwd-word (idx)
+  (let i (fwd-char idx))
+  (while (< i g-buf-size)
+    (let cp   (utf8-ref-phys i))
+    (let prev (back-char i))
+    ; guard: prev in gap means at gap boundary
+    (when (&& (>= prev g-gap-start) (< prev g-gap-end)) (set! i (fwd-char i)) (return i))
+    (let pcp  (utf8-ref-phys prev))
+    (when (&& (! (ws? cp)) (ws? pcp))
+      (return i))
+    (set! i (fwd-char i)))
+  (return i))
+
+; ---------------------------------------------------------------------------
+; Undo ring — defined before ins/del since del-back/del-range call them
+; ---------------------------------------------------------------------------
+
+; Entry slot at index k (wrap around UNDO-CAP)
+(fn undo-slot (k)
+  (return (+ g-undo-ring (* (% k UNDO-CAP) (sizeof UndoEntry)))))
+
+; Advance oldest to make room for one ring entry
+(fn undo-evict-ring ()
+  (when (== (- g-undo-top g-undo-oldest) UNDO-CAP)
+    (inc! g-undo-oldest)
+    (when (< g-undo-point g-undo-oldest)
+      (global-set! g-undo-point g-undo-oldest))))
+
+; Advance oldest entries until byte-count bytes are free in data pool
+(fn undo-evict-data (byte-count)
+  (while (> (+ g-undo-pool-top byte-count) UNDO-DATA-CAP)
+    (when (== g-undo-oldest g-undo-top)
+      ; No entries left to evict — reset pool
+      (global-set! g-undo-pool-top 0)
+      (return 0))
+    (let old (undo-slot g-undo-oldest))
+    ; Reclaim data if this was a delete entry
+    (when (== (get old UndoEntry type) 1)
+      (let old-end (+ (get old UndoEntry data-off) (get old UndoEntry len)))
+      (global-set! g-undo-pool-top (- g-undo-pool-top old-end))
+      ; Shift remaining data down
+      (memmove g-undo-data (+ g-undo-data old-end) g-undo-pool-top)
+      ; Adjust data-off for all newer delete entries
+      (let k (+ g-undo-oldest 1))
+      (while (< k g-undo-top)
+        (let s (undo-slot k))
+        (when (== (get s UndoEntry type) 1)
+          (set! s UndoEntry data-off (- (get s UndoEntry data-off) old-end)))
+        (inc! k)))
+    (inc! g-undo-oldest)
+    (when (< g-undo-point g-undo-oldest)
+      (global-set! g-undo-point g-undo-oldest))))
+
+; Push type=0 entry (was-insert of n bytes, undo = delete n bytes)
+(fn undo-push-insert (n)
+  (undo-evict-ring)
+  (let slot (undo-slot g-undo-top))
+  (set! slot UndoEntry pos  g-gap-start)
+  (set! slot UndoEntry type 0)
+  (set! slot UndoEntry data-off 0)
+  (set! slot UndoEntry len n)
+  (inc! g-undo-top)
+  (unless g-undoing (global-set! g-undo-point g-undo-top)))
+
+; Push type=1 entry (was-delete of bytes at src, undo = insert bytes)
+(fn undo-push-delete (src byte-count)
+  ; Too large to ever fit — skip undo for this delete
+  (when (> byte-count UNDO-DATA-CAP) (return 0))
+  (undo-evict-ring)
+  (undo-evict-data byte-count)
+  ; copy bytes into pool
+  (memcpy (+ g-undo-data g-undo-pool-top) (+ g-data src) byte-count)
+  (let slot (undo-slot g-undo-top))
+  (set! slot UndoEntry pos      g-gap-start)
+  (set! slot UndoEntry type     1)
+  (set! slot UndoEntry data-off g-undo-pool-top)
+  (set! slot UndoEntry len      byte-count)
+  (inc-by! g-undo-pool-top byte-count)
+  (inc! g-undo-top)
+  (unless g-undoing (global-set! g-undo-point g-undo-top)))
+
+; ---------------------------------------------------------------------------
+; Insert / Delete
+; ---------------------------------------------------------------------------
+
+; Insert codepoint cp at cursor (grows gap if needed); returns bytes written
+(fn ins-char (cp)
+  (when (<= (- g-gap-end g-gap-start) 4)
+    (gap-grow))
+  (let written (utf8-write-phys g-gap-start cp))
+  (inc-by! g-gap-start written)
+  (return written))
+
+; Insert raw bytes from src of length len
+(fn ins-bytes (src len)
+  (let i 0)
+  (while (< i len)
+    (let b (get src i 1))
+    (when (<= (- g-gap-end g-gap-start) 4)
+      (gap-grow))
+    (gbyte! g-gap-start b)
+    (inc! g-gap-start)
+    (inc! i)))
+
+; Delete backward one char from cursor
+(fn del-back ()
+  (let prev (back-char g-gap-end))
+  (when (>= prev g-gap-start) (return g-gap-start))
+  (let sz (- g-gap-start prev))
+  ; save bytes for undo (type=1: was-delete, undo by inserting)
+  (undo-push-delete prev sz)
+  ; expand gap leftward
+  (dec-by! g-gap-start sz)
+  (return g-gap-start))
+
+; Delete a selection from lo to hi (logical positions)
+; Saves bytes to undo as type=1 (was-delete, undo by inserting)
+(fn del-range (lo hi)
+  (when (== lo hi) (return 0))
+  (let from (min2 lo hi))
+  (let to   (max2 lo hi))
+  ; Move gap to 'from'
+  (gap-move from)
+  ; Number of logical bytes to delete
+  (let count (- to from))
+  ; save bytes for undo
+  (undo-push-delete g-gap-end count)
+  ; expand gap rightward over the selection
+  (inc-by! g-gap-end count)
+  (return 0))
+
+; ---------------------------------------------------------------------------
+; Undo apply
+; ---------------------------------------------------------------------------
+
+(fn undo ()
+  (when (<= g-undo-point g-undo-oldest) (return 0))
+  (global-set! g-undoing 1)
+  (dec! g-undo-point)
+  (let slot (undo-slot g-undo-point))
+  (let pos  (get slot UndoEntry pos))
+  (let typ  (get slot UndoEntry type))
+  (let len  (get slot UndoEntry len))
+  (global-set! g-mark -1)
+  ; pos is a logical position — convert to physical if past gap
+  (let phys (if (> pos g-gap-start) (+ pos (- g-gap-end g-gap-start)) pos))
+  (if (== typ 0)
+    (do
+      ; was insert → delete len bytes
+      (gap-move phys)
+      (del-range (- g-gap-start len) g-gap-start))
+    (do
+      ; was delete → re-insert bytes
+      (gap-move phys)
+      (let data-off (get slot UndoEntry data-off))
+      (ins-bytes (+ g-undo-data data-off) len)
+      (undo-push-insert len)))
+  (global-set! g-undoing 0))
+
+; ---------------------------------------------------------------------------
+; Search
+; ---------------------------------------------------------------------------
+
+; Store current selection as search pattern (deletes selection)
+(fn search-store ()
+  (when (== g-mark -1) (return 0))
+  (if (< g-mark g-gap-start)
+    (do
+      ; Selection before cursor — bytes are contiguous at [mark, gap-start)
+      (let pat-len (- g-gap-start g-mark))
+      (when (> pat-len 4095) (set! pat-len 4095))
+      (memcpy g-search-buf (+ g-data g-mark) pat-len)
+      (global-set! g-search-len pat-len))
+    (do
+      ; Selection after cursor — bytes are at [gap-end, gap-end + (mark - gap-start))
+      (let pat-len (- g-mark g-gap-start))
+      (when (> pat-len 4095) (set! pat-len 4095))
+      (memcpy g-search-buf (+ g-data g-gap-end) pat-len)
+      (global-set! g-search-len pat-len)))
+  (del-range g-mark g-gap-start)
+  (global-set! g-mark -1))
+
+; Match search pattern at physical position p; return 1 if match
+(fn search-match-at (p)
+  (when (== g-search-len 0) (return 0))
+  (let i 0)
+  (let pp p)
+  (while (< i g-search-len)
+    (when (>= pp g-buf-size) (return 0))
+    (skip-gap! pp)
+    (when (!= (gbyte pp) (get g-search-buf i 1)) (return 0))
+    (inc! i)
+    (inc! pp))
+  (return 1))
+
+; Search forward from cursor; move cursor to end of match, mark at start
+; keep-mark: if nonzero, don't set mark (used by Ctrl+R / Meta+r)
+(fn search-fwd-impl (keep-mark)
+  (when (== g-search-len 0) (return 0))
+  (let p g-gap-end)
+  (while (< p g-buf-size)
+    (skip-gap! p)
+    (when (search-match-at p)
+      (gap-move p)
+      (unless keep-mark (global-set! g-mark g-gap-start))
+      ; After gap-move(p), matched bytes are now at g-gap-end
+      (gap-move (+ g-gap-end g-search-len))
+      (return 1))
+    (inc! p))
+  (return 0))
+
+(fn search-fwd () (return (search-fwd-impl 0)))
+(fn search-fwd-keep () (return (search-fwd-impl 1)))
+
+; Search backward from cursor; cursor at match start, mark at match end
+(fn search-bck-impl (keep-mark)
+  (when (== g-search-len 0) (return 0))
+  (let p (- g-gap-start 1))
+  (while (>= p 0)
+    (when (&& (>= p g-gap-start) (< p g-gap-end))
+      (set! p (- g-gap-start 1)))
+    (when (< p 0) (return 0))
+    (when (search-match-at p)
+      ; Cursor stays at match start; mark at match end (logical = p + search-len)
+      (gap-move p)
+      (unless keep-mark (global-set! g-mark (+ g-gap-start g-search-len)))
+      (return 1))
+    (dec! p))
+  (return 0))
+
+(fn search-bck () (return (search-bck-impl 0)))
+(fn search-bck-keep () (return (search-bck-impl 1)))
+
+; ---------------------------------------------------------------------------
+; Viewport management
+; ---------------------------------------------------------------------------
+
+; Line start visible — start of screen line for position idx
+(fn line-start-vis (idx)
+  (let ls (line-start idx))
+  (let col 0)
+  (let i ls)
+  (while (< i idx)
+    (let cp (utf8-ref-phys i))
+    (let w (col-width cp))
+    (when (>= (+ col w) g-cols) (set! ls i) (set! col 0))
+    (inc-by! col w)
+    (set! i (fwd-char i)))
+  (return ls))
+
+; Center view around position idx (scroll counter lines up from idx)
+(fn center-view (idx counter)
+  (let i idx)
+  (let c counter)
+  (while (> c 0)
+    (set! i (line-start-vis (back-char (line-start-vis i))))
+    (dec! c))
+  (global-set! g-view-start (bound-idx i)))
+
+(fn check-view ()
+  ; g-view-start is logical (like Scheme)
+  ; Cursor above view?
+  (when (> g-view-start g-gap-start)
+    (center-view g-gap-start (/ g-rows 2))
+    (return 0))
+  ; Cursor below view: walk from view-start to gap-start, count visual rows
+  (let i (cwgs g-view-start))
+  (let row 0) (let col 0)
+  (while (&& (< i g-buf-size) (< i g-gap-start))
+    (let cp (utf8-ref-phys i))
+    (let w (col-width cp))
+    (advance-pos! row col cp w)
+    (inc-by! i (utf8-size (gbyte i))))
+  (when (>= row g-rows)
+    (center-view g-gap-start (/ g-rows 2))))
+
+; ---------------------------------------------------------------------------
+; Rendering
+; ---------------------------------------------------------------------------
+
+; Emit UTF-8 bytes for codepoint cp to output buffer
+(fn out-cp (cp)
+  (if (< cp 0x80)
+    (out-byte cp)
+  (if (< cp 0x800)
+    (do (out-byte (bor 0xC0 (rshift cp 6)))
+        (out-byte (bor 0x80 (band cp 0x3F))))
+  (if (< cp 0x10000)
+    (do (out-byte (bor 0xE0 (rshift cp 12)))
+        (out-byte (bor 0x80 (band (rshift cp 6) 0x3F)))
+        (out-byte (bor 0x80 (band cp 0x3F))))
+  (do (out-byte (bor 0xF0 (rshift cp 18)))
+      (out-byte (bor 0x80 (band (rshift cp 12) 0x3F)))
+      (out-byte (bor 0x80 (band (rshift cp 6) 0x3F)))
+      (out-byte (bor 0x80 (band cp 0x3F))))))))
+
+(fn fill-spaces (n)
+  (let i 0) (while (< i n) (out-byte #\space) (inc! i)))
+
+; Is physical position pos within selection? Mark is a logical position.
+(fn in-selection (pos)
+  (when (== g-mark -1) (return 0))
+  (if (< g-mark g-gap-start)
+    ; Selection before cursor: physical range [mark, gap-start)
+    (return (&& (>= pos g-mark) (< pos g-gap-start)))
+    ; Selection after cursor: physical range [gap-end, gap-end + (mark - gap-start))
+    (return (&& (>= pos g-gap-end) (< pos (+ g-gap-end (- g-mark g-gap-start)))))))
+
+(fn draw ()
+  (let p (cwgs g-view-start))
+  (let row 0)
+  (let col 0)
+  (let cur-fg g-text-color)
+  (let cur-bg g-bg-color)
+  (let last-fg -1)    ; track last emitted colors to avoid redundant escapes
+  (let last-bg -1)
+
+  ; Compute view state for syntax highlighting
+  (when g-cb-compute-vs
+    (global-set! g-view-state
+      (call-ptr-c g-cb-compute-vs ((int64_t) -> int64_t) p)))
+
+  ; Plugin draw-start hook (sets initial fg color from view state)
+  (when g-cb-draw-start
+    (call-ptr-c g-cb-draw-start (() -> void)))
+
+  (while (&& (< p g-buf-size) (< row g-rows))
+    (skip-gap! p)
+
+    ; Background: selection or default
+    (let bg (if (in-selection p) g-hl-color g-bg-color))
+
+    ; Foreground: ask plugin for syntax color
+    (let cp (utf8-ref-phys p))
+    (when g-cb-draw-char
+      (let fg (call-ptr-c g-cb-draw-char ((int64_t int64_t) -> int64_t) p cp))
+      (when (!= fg -1) (set! cur-fg fg)))
+
+    ; Only emit color escape when color actually changes
+    (when (|| (!= cur-fg last-fg) (!= bg last-bg))
+      (set-color2 bg cur-fg)
+      (set! last-fg cur-fg)
+      (set! last-bg bg))
+
+    (let w (col-width cp))
+
+    (if (== cp #\newline)
+      (do
+        (when (!= last-bg g-bg-color)
+          (set-color g-bg-color)
+          (set! last-bg g-bg-color)
+          (set! last-fg -1))
+        (fill-spaces (- g-cols (% col g-cols)))
+        (inc! row) (set! col 0))
+      (do
+        ; wide-char line wrap
+        (when (&& (> w 1) (&& (< 0 (% (+ col w) g-cols)) (< (% (+ col w) g-cols) w)))
+          (fill-spaces (- g-cols (% col g-cols)))
+          (inc! row) (set! col 0))
+        (if (== cp #\tab) (fill-spaces g-tab-size) (out-cp cp))
+        (inc-by! col w)
+        (when (>= col g-cols) (inc! row) (set! col (% col g-cols)))))
+    (inc-by! p (utf8-size (gbyte p))))
+
+  ; Plugin draw-end hook
+  (when g-cb-draw-end
+    (call-ptr-c g-cb-draw-end (() -> void)))
+
+  ; Fill remainder of screen
+  (set-color g-bg-color)
+  (fill-spaces (- (* g-rows g-cols) (+ (* row g-cols) col))))
+
+; Map screen coordinates to physical buffer position
+(fn screen-to-pos (target-row target-col)
+  (let p (cwgs g-view-start))
+  (let row 0) (let col 0)
+  (let prev p)
+  (while (< p g-buf-size)
+    (skip-gap! p)
+    (when (> row target-row) (return prev))
+    (when (&& (== row target-row) (>= col target-col)) (return p))
+    (let cp (utf8-ref-phys p))
+    ; If this is a newline on the target row, stop here (don't go to next line)
+    (when (&& (== cp #\newline) (== row target-row)) (return p))
+    (set! prev p)
+    (let w (col-width cp))
+    (advance-pos! row col cp w)
+    (inc-by! p (utf8-size (gbyte p))))
+  (return p))
+
+; Compute cursor screen position in one walk
+(fn update-cursor-screen ()
+  (let p (cwgs g-view-start)) (let row 0) (let col 0)
+  (while (< p g-buf-size)
+    (when (>= p g-gap-start)
+      (global-set! g-cursor-row row)
+      (global-set! g-cursor-col col)
+      (return 0))
+    (let cp (utf8-ref-phys p))
+    (let w (col-width cp))
+    (advance-pos! row col cp w)
+    (inc-by! p (utf8-size (gbyte p))))
+  (global-set! g-cursor-row row)
+  (global-set! g-cursor-col col)
+  (return 0))
+
+(fn render ()
+  (hide-cursor)
+  (move-cursor 1 1)
+  (draw)
+  (update-cursor-screen)
+  (move-cursor (+ g-cursor-row 1) (+ g-cursor-col 1))
+  (show-cursor)
+  (flush-out))
+
+; ---------------------------------------------------------------------------
+; Input reading
+; ---------------------------------------------------------------------------
+
+(fn set-esc-param (idx val)
+  (if (== idx 0) (global-set! g-esc-p0 val)
+  (if (== idx 1) (global-set! g-esc-p1 val)
+  (if (== idx 2) (global-set! g-esc-p2 val)
+  (if (== idx 3) (global-set! g-esc-p3 val)
+  (if (== idx 4) (global-set! g-esc-p4 val)
+                  (global-set! g-esc-p5 val)))))))
+
+; Read one byte from stdin into static buffer; returns byte value
+(fn read-byte ()
+  (read (c-const STDIN_FILENO)g-read1 1)
+  (return (get g-read1 0 1)))
+
+; Check if stdin has data within 50ms (for escape sequence tail)
+(fn stdin-ready ()
+  (set! g-pfd PollFd fd     (c-const STDIN_FILENO))
+  (set! g-pfd PollFd events (c-const POLLIN))
+  (let r (poll g-pfd 1 50))
+  (return (> r 0)))
+
+; Input event types (stored in g-input-* globals)
+(global g-input-type  0)   ; 0=char 1=esc+char(meta) 2=CSI sequence
+(global g-input-key   0)   ; single byte for type=0
+; For escape sequences: up to 6 numeric params + final byte
+(global g-esc-p0  0) (global g-esc-p1  0) (global g-esc-p2  0)
+(global g-esc-p3  0) (global g-esc-p4  0) (global g-esc-p5  0)
+(global g-esc-final 0)
+
+(fn read-input ()
+  (let b (read-byte))
+  (if (!= b #\esc)
+    (do
+      (global-set! g-input-type 0)
+      (global-set! g-input-key  b))
+    ; ESC — check for sequence
+    (if (! (stdin-ready))
+      (do
+        (global-set! g-input-type 0)
+        (global-set! g-input-key  #\esc))
+      (do
+        (let b2 (read-byte))
+        (if (!= b2 #\[)   ; ESC + not '[' = Alt+char
+          (do
+            (global-set! g-input-type 1)
+            (global-set! g-esc-p0  b2)
+            (global-set! g-esc-final 0))
+          ; ESC [ — CSI sequence
+          (do
+            (global-set! g-input-type 2)
+            (global-set! g-esc-p0 0)
+            (global-set! g-esc-p1 0)
+            (global-set! g-esc-p2 0)
+            (global-set! g-esc-p3 0)
+            (global-set! g-esc-p4 0)
+            (global-set! g-esc-p5 0)
+            (global-set! g-esc-final 0)
+            (let param-idx 0)
+            (let cur-val   0)
+            (let done 0)
+            (while (! done)
+              (let cb (read-byte))
+              (if (&& (>= cb #\<) (<= cb #\?))
+                (set! cb cb)  ; skip private parameter prefix bytes (<=>?)
+              (if (&& (>= cb #\0) (<= cb #\9))
+                (set! cur-val (+ (* cur-val 10) (- cb #\0)))
+              (if (== cb #\;)   ; ';' separator
+                (do (set-esc-param param-idx cur-val)
+                    (inc! param-idx)
+                    (set! cur-val 0))
+              (do
+                (set-esc-param param-idx cur-val)
+                (global-set! g-esc-final cb)
+                (set! done 1))))))))))))
+
+
+; Ctrl+X = codepoint X - 64
+(fn ctrl (c) (return (- c 64)))
+
+; ---------------------------------------------------------------------------
+; Editor operations
+; ---------------------------------------------------------------------------
+
+(fn ed-move-back  () (gap-move (back-char g-gap-end)))
+(fn ed-move-fwd   () (gap-move (fwd-char  g-gap-end)))
+(fn ed-move-up    () (gap-move (move-up   g-gap-end)))
+(fn ed-move-down  () (gap-move (move-down g-gap-end)))
+(fn ed-line-start () (gap-move (line-start g-gap-end)))
+(fn ed-line-end   () (gap-move (line-end   g-gap-end)))
+(fn ed-back-word  () (gap-move (back-word  g-gap-end)))
+(fn ed-fwd-word   () (gap-move (fwd-word   g-gap-end)))
+
+(fn ed-center ()
+  (center-view g-gap-start (/ g-rows 2)))
+
+(fn ed-page-down ()
+  (gap-move (repeat-move (cwgs g-view-start) (fn-ptr move-down) (+ g-rows 1))))
+
+(fn ed-page-up ()
+  (gap-move (repeat-move (cwgs g-view-start) (fn-ptr move-up) (/ g-rows 4))))
+
+(fn ed-move-up5   () (gap-move (repeat-move g-gap-end (fn-ptr move-up) 5)))
+(fn ed-move-down5 () (gap-move (repeat-move g-gap-end (fn-ptr move-down) 5)))
+
+(fn ed-toggle-mark ()
+  (if (== g-mark -1)
+    (global-set! g-mark g-gap-start)
+    (global-set! g-mark -1)))
+
+(fn ed-delete ()
+  (if (!= g-mark -1)
+    (do (del-range g-mark g-gap-start) (global-set! g-mark -1))
+    (do
+      (let prev (back-char g-gap-end))
+      (when (< prev g-gap-start)
+        (undo-push-delete prev (- g-gap-start prev))
+        (dec-by! g-gap-start (- g-gap-start prev))))))
+
+(fn ed-delete-fwd ()
+  (when (< g-gap-end g-buf-size)
+    (undo-push-delete g-gap-end (utf8-size (gbyte g-gap-end)))
+    (inc-by! g-gap-end (utf8-size (gbyte g-gap-end)))))
+
+(fn ins-spaces (n)
+  (let i 0)
+  (while (< i n) (ins-char #\space) (undo-push-insert 1) (inc! i)))
+
+; Insert codepoint with undo tracking
+(fn ed-insert (cp)
+  (let n (ins-char cp))
+  (undo-push-insert n))
+
+(fn ed-insert-newline ()
+  (ins-char #\newline)
+  (undo-push-insert 1)
+  ; Plugin on-newline hook for auto-indent
+  (when g-cb-on-newline
+    (let indent (call-ptr-c g-cb-on-newline (() -> int64_t)))
+    (when (>= indent 0)
+      (ins-spaces indent))))
+
+(fn ed-insert-tab ()
+  (ins-spaces g-tab-size))
+
+; Auto-insert paired bracket
+(fn ed-insert-pair (open close)
+  (ins-char open)  (undo-push-insert 1)
+  (ins-char close) (undo-push-insert 1)
+  (gap-move (back-char g-gap-end)))
+
+; Jump to line number stored in current selection
+(fn ed-jump-to-impl (keep-mark)
+  (when (== g-mark -1) (return 0))
+  ; Read selection bytes — always move gap to start of selection first
+  (let sel-start (min2 g-mark g-gap-start))
+  (let sel-len (- (max2 g-mark g-gap-start) sel-start))
+  (gap-move sel-start)
+  ; Now selection bytes are at [gap-end, gap-end + sel-len)
+  (let num 0)
+  (let i 0)
+  (while (< i sel-len)
+    (let cp (utf8-ref-phys (+ g-gap-end i)))
+    (when (&& (>= cp #\0) (<= cp #\9))
+      (set! num (+ (* num 10) (- cp #\0))))
+    (inc-by! i (utf8-size (gbyte (+ g-gap-end i)))))
+  (del-range g-gap-start (+ g-gap-start sel-len))
+  (if keep-mark
+    (global-set! g-mark g-gap-start)
+    (global-set! g-mark -1))
+  (when (<= num 0) (return 0))
+  ; walk buffer counting newlines
+  (let p 0)
+  (let line 1)
+  (while (< p g-buf-size)
+    (skip-gap! p)
+    (when (>= line num) (gap-move p) (return 0))
+    (when (== (gbyte p) #\newline) (inc! line))
+    (inc! p))
+  (gap-move g-buf-size))
+(fn ed-jump-to () (return (ed-jump-to-impl 0)))
+(fn ed-jump-to-keep () (return (ed-jump-to-impl 1)))
+
+; ---------------------------------------------------------------------------
+; Clipboard
+; ---------------------------------------------------------------------------
+
+(global g-copy-cmd  (alloc 64))
+(global g-paste-cmd (alloc 64))
+
+(fn init-clipboard ()
+  (let wayland (getenv "WAYLAND_DISPLAY"))
+  (let is-wl (if (! (null? wayland)) (> (strlen wayland) 0) 0))
+  ; Detect macOS: try popen("pbcopy --version") — pbcopy exists on all Macs
+  (let probe (popen "command -v pbcopy >/dev/null 2>&1 && echo y" "r"))
+  (let is-mac 0)
+  (when (! (null? probe))
+    (let ch (fgetc probe))
+    (when (== ch #\y) (set! is-mac 1))
+    (pclose probe))
+  (if is-mac
+    (do
+      (cpy-lit g-copy-cmd  "pbcopy")
+      (cpy-lit g-paste-cmd "pbpaste"))
+  (if is-wl
+    (do
+      (cpy-lit g-copy-cmd  "wl-copy")
+      (cpy-lit g-paste-cmd "wl-paste"))
+  (do
+    (cpy-lit g-copy-cmd  "xclip -selection clipboard")
+    (cpy-lit g-paste-cmd "xclip -selection clipboard -o")))))
+
+(fn ed-copy ()
+  (when (== g-mark -1) (return 0))
+  (let f (popen g-copy-cmd "w"))
+  (when (null? f) (return 0))
+  (if (< g-mark g-gap-start)
+    ; Selection before cursor: physical [mark, gap-start)
+    (fwrite (+ g-data g-mark) 1 (- g-gap-start g-mark) f)
+    ; Selection after cursor: physical [gap-end, gap-end + (mark - gap-start))
+    (fwrite (+ g-data g-gap-end) 1 (- g-mark g-gap-start) f))
+  (pclose f)
+  (global-set! g-mark -1))
+
+(fn ed-cut ()
+  (when (== g-mark -1) (return 0))
+  (let saved-mark g-mark)
+  (ed-copy)
+  (del-range saved-mark g-gap-start)
+  (global-set! g-mark -1))
+
+(fn ed-paste ()
+  (when (!= g-mark -1)
+    (del-range g-mark g-gap-start)
+    (global-set! g-mark -1))
+  (let f (popen g-paste-cmd "r"))
+  (when (null? f) (return 0))
+  (let buf (alloc 4096))
+  (while (! (feof f))
+    (let n (fread buf 1 4096 f))
+    (ins-bytes buf n))
+  (pclose f))
+
+; ---------------------------------------------------------------------------
+; Shell execute (run selection as shell command, insert output)
+; ---------------------------------------------------------------------------
+
+; Strip \r bytes from buf in-place, return new length
+(fn strip-cr (buf n)
+  (let j 0)
+  (let i 0)
+  (while (< i n)
+    (let b (get buf i 1))
+    (when (!= b #\return)
+      (set! buf j 1 b)
+      (inc! j))
+    (inc! i))
+  (return j))
+
+(fn ed-shell-exec (delete-cmd)
+  (when (== g-mark -1) (return 0))
+  ; Move gap to start of selection so bytes are contiguous after gap
+  (let sel-start (min2 g-mark g-gap-start))
+  (let sel-len (- (max2 g-mark g-gap-start) sel-start))
+  (gap-move sel-start)
+  (let cmd-buf (alloc 4096))
+  (let cmd-len (min2 sel-len 4090))  ; leave room for " 2>&1\0"
+  (memcpy cmd-buf (+ g-data g-gap-end) cmd-len)
+  ; Append " 2>&1" to capture stderr through the same pipe
+  (cpy-lit (+ cmd-buf cmd-len) " 2>&1")
+  (when delete-cmd
+    (del-range g-gap-start (+ g-gap-start sel-len))
+    (global-set! g-mark -1))
+  (global-set! g-mark g-gap-start)
+  (let f (popen cmd-buf "r"))
+  (when (null? f) (return 0))
+  (let pipe-fd (fileno f))
+  (let pfds (alloc 16))           ; 2 PollFd structs (8 bytes each)
+  (let buf (alloc 4096))
+  (let done 0)
+  (while (! done)
+    ; Poll pipe fd and stdin with 100ms timeout
+    (set! pfds PollFd fd pipe-fd)
+    (set! pfds PollFd events (c-const POLLIN))
+    (set! (+ pfds 8) PollFd fd (c-const STDIN_FILENO))
+    (set! (+ pfds 8) PollFd events (c-const POLLIN))
+    (poll pfds 2 100)
+    ; Check pipe for data or hangup
+    (let prev (get pfds PollFd revents))
+    (when (band prev (bor (c-const POLLIN) (c-const POLLHUP)))
+      (let n (read pipe-fd buf 4096))
+      (when (> n 0)
+        (let clean (strip-cr buf n))
+        (when (> clean 0) (ins-bytes buf clean)))
+      (when (<= n 0) (set! done 1)))
+    ; Check stdin for Ctrl+C (byte 3)
+    (let srev (get (+ pfds 8) PollFd revents))
+    (when (band srev (c-const POLLIN))
+      (read (c-const STDIN_FILENO)g-read1 1)
+      (when (== (get g-read1 0 1) (ctrl 67))   ; Ctrl+C
+        (set! done 1)))
+    ; Render incrementally so output appears as it arrives
+    (check-view)
+    (render))
+  (pclose f))
+
+; ---------------------------------------------------------------------------
+; File I/O
+; ---------------------------------------------------------------------------
+
+(fn write-file ()
+  (when (== g-fname-len 0) (return 0))
+  ; null-terminate fname
+  (set! g-fname g-fname-len 1 0)
+  (let f (fopen g-fname "w"))
+  (when (null? f) (return 0))
+  ; write everything before gap, then after
+  (when (> g-gap-start 0)
+    (fwrite g-data 1 g-gap-start f))
+  (let tail-start g-gap-end)
+  (let tail-len   (- g-buf-size g-gap-end))
+  (when (> tail-len 0)
+    (fwrite (+ g-data g-gap-end) 1 tail-len f))
+  (fclose f))
+
+(fn ext-match2 (p c0 c1)
+  (return (&& (== (get p 0 1) c0) (== (get p 1 1) c1))))
+
+(fn ext-match3 (p c0 c1 c2)
+  (return (&& (== (get p 0 1) c0)
+              (&& (== (get p 1 1) c1)
+                   (== (get p 2 1) c2)))))
+
+(fn detect-file-type (path path-len)
+  (global-set! g-file-type 0)
+  (let i (- path-len 1))
+  (while (>= i 0)
+    (let b (get path i 1))
+    (when (== b #\.)
+      (let ext (+ path (+ i 1)))
+      (let ext-len (- path-len (+ i 1)))
+      ; Scheme-like: .ss .scm .sls .anc
+      (when (== ext-len 2)
+        (when (ext-match2 ext #\s #\s)
+          (global-set! g-file-type 1))
+        (when (ext-match2 ext #\p #\y)
+          (global-set! g-file-type 3)))
+      (when (== ext-len 3)
+        (when (ext-match3 ext #\s #\c #\m)
+          (global-set! g-file-type 1))
+        (when (ext-match3 ext #\s #\l #\s)
+          (global-set! g-file-type 1))
+        (when (ext-match3 ext #\a #\n #\c)
+          (global-set! g-file-type 1))
+        (when (ext-match3 ext #\c #\p #\p)
+          (global-set! g-file-type 2)))
+      ; C-like: .c .h
+      (when (== ext-len 1)
+        (when (|| (== (get ext 0 1) #\c)
+                  (== (get ext 0 1) #\h))
+          (global-set! g-file-type 2)))
+      (return 0))
+    (dec! i)))
+
+(fn load-file (path path-len)
+  (memcpy g-fname path path-len)
+  (global-set! g-fname-len path-len)
+  (set! g-fname path-len 1 0)
+  (detect-file-type path path-len)
+  ; free old buffer
+  (when (! (null? g-data))
+    (free g-data))
+  ; open file
+  (let f (fopen path "r"))
+  (if (null? f)
+    (do
+      ; new file: empty buffer
+      (global-set! g-data (malloc INIT-GAP))
+      (global-set! g-buf-size INIT-GAP)
+      (global-set! g-gap-start 0)
+      (global-set! g-gap-end INIT-GAP))
+    (do
+      ; get file size, allocate gap buffer, read directly
+      (fseek f 0 (c-const SEEK_END))
+      (let file-size (ftell f))
+      (fseek f 0 (c-const SEEK_SET))
+      (let new-size (+ INIT-GAP file-size))
+      (global-set! g-data (malloc new-size))
+      (global-set! g-buf-size new-size)
+      (global-set! g-gap-start 0)
+      (global-set! g-gap-end INIT-GAP)
+      (fread (+ g-data INIT-GAP) 1 file-size f)
+      (fclose f)))
+  (global-set! g-view-start 0)
+  (global-set! g-mark -1))
+
+; ---------------------------------------------------------------------------
+; Config .dylib — API accessors and plugin loading
+; ---------------------------------------------------------------------------
+
+; State getters
+(fn api-get-data-ptr   () (return g-data))
+(fn api-get-gap-start  () (return g-gap-start))
+(fn api-get-gap-end    () (return g-gap-end))
+(fn api-get-buf-size   () (return g-buf-size))
+(fn api-get-view-start () (return g-view-start))
+(fn api-get-mark       () (return g-mark))
+(fn api-get-cols       () (return g-cols))
+(fn api-get-rows       () (return g-rows))
+(fn api-get-tab-size   () (return g-tab-size))
+(fn api-get-file-type  () (return g-file-type))
+; Buffer navigation
+(fn api-col-width      (cp) (return (col-width cp)))
+; Mutators
+(fn api-set-tab-size   (n) (global-set! g-tab-size   n))
+(fn api-set-hl-color   (n) (global-set! g-hl-color   n))
+(fn api-set-bg-color   (n) (global-set! g-bg-color   n))
+(fn api-set-text-color (n) (global-set! g-text-color n))
+(fn api-ins-char       (cp) (return (ins-char cp)))
+(fn api-ins-spaces     (n) (ins-spaces n) (return 0))
+(fn api-gap-move       (p) (gap-move p) (return 0))
+(fn api-render         () (check-view) (render) (return 0))
+(fn api-write-file     () (write-file) (return 0))
+(fn api-undo-push-ins  (n) (undo-push-insert n) (return 0))
+; Callback registration
+(fn api-reg-draw-start (f) (global-set! g-cb-draw-start f))
+(fn api-reg-draw-char  (f) (global-set! g-cb-draw-char  f))
+(fn api-reg-draw-end   (f) (global-set! g-cb-draw-end   f))
+(fn api-reg-on-key     (f) (global-set! g-cb-on-key     f))
+(fn api-reg-on-newline (f) (global-set! g-cb-on-newline f))
+(fn api-reg-compute-vs (f) (global-set! g-cb-compute-vs f))
+
+(fn load-config ()
+  ; Build path ~/.config/buged/config.dylib
+  (let home (getenv "HOME"))
+  (when (null? home) (return 0))
+  (let path-buf (alloc 512))
+  (let home-len (strlen home))
+  (memcpy path-buf home home-len)
+  (cpy-lit (+ path-buf home-len) "/.config/buged/config.dylib")
+  ; Try dlopen
+  (let handle (dlopen path-buf (bor (c-const RTLD_LAZY) (c-const RTLD_LOCAL))))
+  (when (null? handle) (return 0))
+  (global-set! g-config-handle handle)
+  ; Fill EditorAPI struct from define-api mapping
+  (populate-EditorAPI g-config-api)
+  ; Call buged_init
+  (let init-fn (dlsym handle "buged_init"))
+  (when (! (null? init-fn))
+    (call-ptr-c init-fn ((void*) -> void) g-config-api))
+  (return 0))
+
+; ---------------------------------------------------------------------------
+; Key bindings dispatch
+; ---------------------------------------------------------------------------
+
+(fn dispatch-mouse (press)
+  (let btn g-esc-p0)
+  (let col (- g-esc-p1 1))   ; 0-based
+  (let row (- g-esc-p2 1))   ; 0-based
+  ; Scroll wheel up — view moves earlier (1 line, matching Scheme ref)
+  (when (== btn 64)
+    (let new-vs (move-up (cwgs g-view-start)))
+    (global-set! g-view-start (bound-idx new-vs))
+    ; Walk to screen bottom; if cursor is at/past one line above it, pull cursor up
+    ; This matches Scheme: curs-yx to find bottom pos, then move-up from there
+    (let i (cwgs g-view-start)) (let vrow 0) (let vcol 0)
+    (while (&& (< i g-buf-size) (< vrow g-rows))
+      (skip-gap! i)
+      (let cp (utf8-ref-phys i))
+      (let w (col-width cp))
+      (advance-pos! vrow vcol cp w)
+      (inc-by! i (utf8-size (gbyte i))))
+    ; i = first position past visible area (clamp to buf-size)
+    (when (> i g-buf-size) (set! i g-buf-size))
+    (let boundary (move-up i))
+    (when (>= g-gap-end boundary)
+      (gap-move boundary))
+    (return 0))
+  ; Scroll wheel down — view moves later (1 line, matching Scheme exactly)
+  ; g-view-start is logical; move-down takes physical, returns physical
+  (when (== btn 65)
+    (let vs-phys (cwgs g-view-start))
+    (let new-vs (move-down vs-phys))
+    (when (> new-vs g-gap-end)
+      (gap-move (move-down g-gap-end))
+      ; Recompute vs-phys: g-view-start (logical) unchanged, gap moved forward
+      (set! vs-phys (cwgs g-view-start))
+      (set! new-vs (move-down vs-phys)))
+    (global-set! g-view-start (bound-idx new-vs))
+    (return 0))
+  ; Mouse drag (btn=32): move cursor, keep mark
+  (when (== btn 32)
+    (gap-move (screen-to-pos row col))
+    (return 0))
+  ; Left button
+  (when (== btn 0)
+    (when press
+      (gap-move (screen-to-pos row col))
+      (global-set! g-mark g-gap-start)
+      (global-set! g-clicked-y row)
+      (global-set! g-clicked-x col))
+    (when (! press)
+      ; release at same position as click = tap → clear mark
+      (when (&& (== row g-clicked-y) (== col g-clicked-x))
+        (global-set! g-mark -1))
+      (global-set! g-clicked-y -1)
+      (global-set! g-clicked-x -1)))
+  (return 0))
+
+; Returns 1 if input was handled, 2 if quit, 3 if suspend
+(fn dispatch-key ()
+  (let t g-input-type)
+  (let k g-input-key)
+
+  ; Plugin on-key hook — gets first crack at all input
+  (when g-cb-on-key
+    (let r (call-ptr-c g-cb-on-key
+      ((int64_t int64_t int64_t int64_t int64_t) -> int64_t)
+      t k g-esc-p0 g-esc-p1 g-esc-p2))
+    (when (== r 1) (return 1)))
+
+  ; --- type 0: regular byte ---
+  (when (== t 0)
+    (when (== k (ctrl #\D)) (ed-delete-fwd) (return 1))
+    (when (== k (ctrl #\B)) (ed-move-back)  (return 1))
+    (when (== k (ctrl #\F)) (ed-move-fwd)   (return 1))
+    (when (== k (ctrl #\P)) (ed-move-up)    (return 1))
+    (when (== k (ctrl #\N)) (ed-move-down)  (return 1))
+    (when (== k (ctrl #\A)) (ed-line-start) (return 1))
+    (when (== k (ctrl #\E)) (ed-line-end)   (return 1))
+    (when (== k (ctrl #\V)) (ed-page-down)  (return 1))
+    (when (== k (ctrl #\L)) (ed-center)     (return 1))
+    (when (== k (ctrl #\H)) (ed-toggle-mark)(return 1))
+    (when (== k (ctrl #\G)) (ed-jump-to)    (return 1))
+    (when (== k (ctrl #\Q)) (search-fwd)      (return 1))
+    (when (== k (ctrl #\R)) (search-fwd-keep) (return 1))
+    (when (== k (ctrl #\O)) (ed-shell-exec 1) (return 1))
+    (when (== k (ctrl #\C)) (ed-copy)       (return 1))
+    (when (== k (ctrl #\K)) (ed-cut)        (return 1))
+    (when (== k (ctrl #\Y)) (ed-paste)      (return 1))
+    (when (== k (ctrl #\W)) (write-file)    (return 1))
+    (when (== k (ctrl #\X)) (return 2))                   ; quit
+    (when (== k (ctrl #\_)) (undo)          (return 1))
+    (when (== k (ctrl #\Z)) (return 3))                   ; suspend
+    ; Delete key
+    (when (== k #\delete)     (ed-delete)    (return 1))
+    ; Tab
+    (when (== k #\tab)     (ed-insert-tab)(return 1))
+    ; Enter
+    (when (== k #\return)      (ed-insert-newline) (return 1))
+    ; Auto-pair brackets
+    (when (== k #\() (ed-insert-pair #\( #\)) (return 1))
+    (when (== k #\[) (ed-insert-pair #\[ #\]) (return 1))
+    (when (== k #\{) (ed-insert-pair #\{ #\}) (return 1))
+    ; Printable chars
+    (when (|| (>= k #\space) (== k #\newline))
+      (ed-insert k)
+      (return 1))
+    (return 0))
+
+  ; --- type 1: ESC + char (Meta key) ---
+  (when (== t 1)
+    (let mc g-esc-p0)
+    (when (== mc #\b) (ed-back-word)  (return 1))
+    (when (== mc #\f) (ed-fwd-word)   (return 1))
+    (when (== mc #\h) (ed-toggle-mark)(return 1))
+    (when (== mc #\p) (ed-move-up5)   (return 1))
+    (when (== mc #\n) (ed-move-down5) (return 1))
+    (when (== mc #\v) (ed-page-up)    (return 1))
+    (when (== mc #\g) (ed-jump-to-keep) (return 1))
+    (when (== mc #\q) (search-bck)      (return 1))
+    (when (== mc #\Q) (search-store)   (return 1))
+    (when (== mc #\r) (search-bck-keep)(return 1))
+    (when (== mc #\R) (search-store)   (return 1))
+    (when (== mc #\o) (ed-shell-exec 0) (return 1))
+    (when (== mc #\y) (ed-paste)      (return 1))
+    (return 0))
+
+  ; --- type 2: CSI sequence (arrows, mouse, etc.) ---
+  (when (== t 2)
+    (let fin g-esc-final)
+    ; Arrow keys: ESC[A up, B down, C right, D left
+    (when (== fin #\A) (ed-move-up)    (return 1))  ; up
+    (when (== fin #\B) (ed-move-down)  (return 1))  ; down
+    (when (== fin #\C) (ed-move-fwd)   (return 1))  ; right
+    (when (== fin #\D) (ed-move-back)  (return 1))  ; left
+    ; Delete: ESC[3~
+    (when (&& (== fin #\~) (== g-esc-p0 3))
+      (ed-delete-fwd) (return 1))
+    ; SGR mouse: ESC[<btn;col;rowM or m
+    (when (== fin #\M)   ; press
+      (dispatch-mouse 1)
+      (return 1))
+    (when (== fin #\m)   ; release
+      (dispatch-mouse 0)
+      (return 1))
+    (return 0))
+  (return 0))
+
+; ---------------------------------------------------------------------------
+; Endwin / cleanup
+; ---------------------------------------------------------------------------
+
+(fn endwin ()
+  (global-set! g-out-len 0)
+  (mouse-off)
+  (screen-alt-off)
+  (term-raw-off)
+  (flush-out))
+
+; ---------------------------------------------------------------------------
+; Main
+; ---------------------------------------------------------------------------
+
+(fn main (argc argv)
+  (setlocale (c-const LC_ALL) "en_US.UTF-8")
+
+  ; Init gap buffer for empty file
+  (global-set! g-data (malloc INIT-GAP))
+  (global-set! g-buf-size  INIT-GAP)
+  (global-set! g-gap-start 0)
+  (global-set! g-gap-end   INIT-GAP)
+
+  ; Init clipboard
+  (init-clipboard)
+
+  ; Init terminal
+  (term-raw-on)
+  (screen-alt-on)
+  (mouse-on)
+  (flush-out)
+  (term-get-size)
+
+  ; Register SIGWINCH
+  (signal (c-const SIGWINCH) (fn-ptr sigwinch-handler))
+
+  ; Poll fd init (used by stdin-ready)
+  (set! g-pfd PollFd fd     (c-const STDIN_FILENO))
+  (set! g-pfd PollFd events (c-const POLLIN))
+
+  ; Load file from argv[1] if present
+  (when (> argc 1)
+    (let path (get argv 8 8))  ; argv[1] = *(argv+8)
+    (let path-ptr (cast char* path))
+    (load-file path-ptr (strlen path-ptr)))
+
+  ; Load config .so
+  (with-arena (kb 1)
+    (load-config))
+
+  ; Main loop
+  (let running 1)
+  (while running
+    (with-arena (kb 16)
+      (check-view)
+      (render)
+
+      ; Handle pending resize
+      (when g-resized
+        (global-set! g-resized 0)
+        (term-get-size)
+        (check-view))
+
+      (read-input)
+      (let result (dispatch-key))
+
+      (when (== result 2)   ; quit
+        (set! running 0))
+      (when (== result 3)   ; suspend
+        (endwin)
+        (kill (getpid) (c-const SIGTSTP))
+        (term-raw-on)
+        (screen-alt-on)
+        (mouse-on)
+        (flush-out))))
+
+  (endwin)
+  (return 0))

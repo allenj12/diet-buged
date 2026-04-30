@@ -1,0 +1,835 @@
+; config.anc — buged editor syntax highlighting, auto-indent, and keybindings
+;
+; Build:
+;   bash build-config.sh
+;
+; Install location: ~/.config/buged/config.dylib
+;
+; This plugin implements:
+;   - Rainbow parentheses (cycling 4 colors)
+;   - String highlighting (cyan)
+;   - Line comment highlighting (; for Scheme, // for C)
+;   - Block comment highlighting (#|...|# for Scheme, /*...*/ for C)
+;   - Auto-indent (Scheme and C style)
+;   - Ctrl-W visual save (flash black background)
+
+(include <stdint.h>)
+(include <unistd.h>)
+
+(ffi usleep (unsigned) -> int)
+
+; ---------------------------------------------------------------------------
+; EditorAPI struct — must match editor.anc layout exactly
+; ---------------------------------------------------------------------------
+
+(struct EditorAPI
+  (get-data-ptr    8)
+  (get-gap-start   8)
+  (get-gap-end     8)
+  (get-buf-size    8)
+  (get-view-start  8)
+  (get-mark        8)
+  (get-cols        8)
+  (get-rows        8)
+  (get-tab-size    8)
+  (get-file-type   8)
+  (do-gbyte        8)
+  (do-utf8-ref     8)
+  (do-fwd-char     8)
+  (do-back-char    8)
+  (do-line-start   8)
+  (do-col-width    8)
+  (do-set-color    8)
+  (do-set-tab-size 8)
+  (do-set-hl-color 8)
+  (do-set-bg-color 8)
+  (do-set-text-color 8)
+  (do-ins-char     8)
+  (do-ins-spaces   8)
+  (do-gap-move     8)
+  (do-render       8)
+  (do-write-file   8)
+  (do-undo-push-ins 8)
+  (reg-draw-start  8)
+  (reg-draw-char   8)
+  (reg-draw-end    8)
+  (reg-on-key      8)
+  (reg-on-newline  8)
+  (reg-compute-vs  8))
+
+
+; ---------------------------------------------------------------------------
+; Macros
+; ---------------------------------------------------------------------------
+
+(define-syntax when
+  (syntax-rules () [(_ c b ...) (if c (do b ...))]))
+
+; str-eq-lit: (str-eq-lit len "word") → (str-eq-lit len "word")
+(define-syntax str-eq-lit
+  (macro-case ()
+    [(_ len s) `(str-eq ,len ,s ,(string-length s))]))
+
+(define-syntax unless
+  (syntax-rules () [(_ c b ...) (if (! c) (do b ...))]))
+
+(define-syntax inc!
+  (syntax-rules () [(_ x) (set! x (+ x 1))]))
+
+(define-syntax dec!
+  (syntax-rules () [(_ x) (set! x (- x 1))]))
+
+(define-syntax inc-by!
+  (syntax-rules () [(_ x n) (set! x (+ x n))]))
+
+; Call editor API function through stored pointer
+(define-syntax api
+  (macro-case ()
+    [(_ field)         `(call-ptr (get g-api EditorAPI ,field))]
+    [(_ field a)       `(call-ptr (get g-api EditorAPI ,field) ,a)]
+    [(_ field a b)     `(call-ptr (get g-api EditorAPI ,field) ,a ,b)]))
+
+; ---------------------------------------------------------------------------
+; Section state and file type constants
+; ---------------------------------------------------------------------------
+
+(const SEC-NONE    0)
+(const SEC-STRING  1)
+(const SEC-BLOCK   2)
+(const SEC-LINE    3)
+(const SEC-TRISTR  4)  ; Python triple-quote string (""" or ''')
+
+(const FT-NONE    0)
+(const FT-SCHEME  1)
+(const FT-C       2)
+(const FT-PYTHON  3)
+
+; ---------------------------------------------------------------------------
+; Globals
+; ---------------------------------------------------------------------------
+
+(global g-api       0)     ; EditorAPI pointer (set during init)
+(global g-section   0)     ; SEC-NONE
+(global g-depth    -1)     ; rainbow paren depth
+(global g-view-state 0)   ; SEC-NONE
+(global g-ft        0)     ; FT-NONE — cached file-type (set in draw-start)
+(global g-str-quote 0)     ; quote char that opened current string (" or ')
+(global g-tri-quote 0)     ; quote char that opened triple-string (" or ')
+
+; View-state checkpoints — avoid rescanning from 0
+; Indexed by LOGICAL position / CP-INTERVAL (stable across gap moves).
+; Only invalidated when file content changes (buf-size changes).
+(const CP-INTERVAL 4096)
+(const CP-MAX      4096)   ; covers up to 16MB
+(global g-cp-states (alloc (kb 32)))  ; 4096 checkpoints × 8 bytes
+(global g-cp-high   -1)    ; highest valid checkpoint index (logical)
+(global g-cp-bs     -1)    ; buf-size when checkpoints were built
+
+; C keyword highlighting state
+(global g-kw-remaining 0)  ; chars left to color in current keyword
+(global g-kw-color     0)  ; color for current keyword
+(global g-kw-buf (alloc 20))  ; scratch buffer for reading words
+(global g-prev-word    0)  ; was previous drawn char a word char?
+
+; ---------------------------------------------------------------------------
+; Colors
+; ---------------------------------------------------------------------------
+
+(const COMMENT-COLOR  32)   ; green
+(const TEXT-COLOR     39)   ; default fg
+(const STRING-COLOR   36)   ; cyan
+(const KW-COLOR       35)   ; magenta — C keywords
+(const TYPE-COLOR     34)   ; blue — C type names
+(const PAREN-0        31)   ; red
+(const PAREN-1        32)   ; green
+(const PAREN-2        33)   ; yellow
+(const PAREN-3        34)   ; blue
+
+; ---------------------------------------------------------------------------
+; Helpers
+; ---------------------------------------------------------------------------
+
+
+(fn escaped? (pos)
+  (when (<= pos 0) (return 0))
+  (return (== (prev-byte pos) #\\)))
+
+(fn paren-color (d)
+  (when (< d 0) (return TEXT-COLOR))
+  (let m (% d 4))
+  (if (== m 0) (return PAREN-0)
+  (if (== m 1) (return PAREN-1)
+  (if (== m 2) (return PAREN-2)
+               (return PAREN-3)))))
+
+; Peek next byte safely (skips gap via fwd-char)
+(fn next-byte (pos)
+  (let nxt (api do-fwd-char pos))
+  (when (>= nxt (api get-buf-size)) (return 0))
+  (return (api do-gbyte nxt)))
+
+; Peek prev byte safely (skips gap via back-char)
+(fn prev-byte (pos)
+  (let prv (api do-back-char pos))
+  (when (>= prv pos) (return 0))  ; back-char returned same or higher = at start
+  (return (api do-gbyte prv)))
+
+(fn open-paren? (cp)
+  (return (|| (== cp #\() (|| (== cp #\[) (== cp #\{)))))
+
+(fn close-paren? (cp)
+  (return (|| (== cp #\)) (|| (== cp #\]) (== cp #\})))))
+
+; Check if pos starts a triple-quote (""" or ''')
+; Returns the quote char (34 or 39) or 0
+(fn triple-quote? (pos cp)
+  (when (|| (== cp #\") (== cp #\'))
+    (let n1 (api do-fwd-char pos))
+    (when (>= n1 (api get-buf-size)) (return 0))
+    (when (!= (api do-utf8-ref n1) cp) (return 0))
+    (let n2 (api do-fwd-char n1))
+    (when (>= n2 (api get-buf-size)) (return 0))
+    (when (== (api do-utf8-ref n2) cp) (return cp)))
+  (return 0))
+
+; Is char a quote prefix? ' ` @
+(fn quoted-char? (cp)
+  (return (|| (== cp #\') (|| (== cp #\`) (== cp #\@)))))
+
+; Character classification for keyword detection
+(fn alpha? (cp)
+  (return (|| (&& (>= cp #\A) (<= cp #\Z))
+              (&& (>= cp #\a) (<= cp #\z)))))
+
+(fn word-char? (cp)
+  (return (|| (alpha? cp) (|| (== cp #\_) (&& (>= cp #\0) (<= cp #\9))))))
+
+; Read word at pos into g-kw-buf, return length (max 16)
+(fn read-word-len (pos)
+  (let p pos) (let n 0)
+  (while (< n 16)
+    (when (>= p (api get-buf-size)) (return n))
+    (let cp (api do-utf8-ref p))
+    (when (! (word-char? cp)) (return n))
+    (set! g-kw-buf n 1 cp)
+    (inc! n)
+    (set! p (api do-fwd-char p)))
+  (return n))
+
+; Compare g-kw-buf against a string literal
+(fn str-eq (len s slen)
+  (when (!= len slen) (return 0))
+  (let i 0)
+  (while (< i len)
+    (when (!= (get g-kw-buf i 1) (get s i 1))
+      (return 0))
+    (inc! i))
+  (return 1))
+
+; Match C keywords → KW-COLOR(35), types → TYPE-COLOR(34), else 0
+(fn c-match-keyword (len)
+  ; --- C keywords (magenta) ---
+  (when (str-eq-lit len "if") (return KW-COLOR))
+  (when (str-eq-lit len "do") (return KW-COLOR))
+  (when (str-eq-lit len "for") (return KW-COLOR))
+  (when (str-eq-lit len "auto") (return KW-COLOR))
+  (when (str-eq-lit len "case") (return KW-COLOR))
+  (when (str-eq-lit len "else") (return KW-COLOR))
+  (when (str-eq-lit len "enum") (return KW-COLOR))
+  (when (str-eq-lit len "goto") (return KW-COLOR))
+  (when (str-eq-lit len "break") (return KW-COLOR))
+  (when (str-eq-lit len "const") (return KW-COLOR))
+  (when (str-eq-lit len "union") (return KW-COLOR))
+  (when (str-eq-lit len "while") (return KW-COLOR))
+  (when (str-eq-lit len "extern") (return KW-COLOR))
+  (when (str-eq-lit len "inline") (return KW-COLOR))
+  (when (str-eq-lit len "return") (return KW-COLOR))
+  (when (str-eq-lit len "sizeof") (return KW-COLOR))
+  (when (str-eq-lit len "static") (return KW-COLOR))
+  (when (str-eq-lit len "struct") (return KW-COLOR))
+  (when (str-eq-lit len "switch") (return KW-COLOR))
+  (when (str-eq-lit len "typeof") (return KW-COLOR))
+  (when (str-eq-lit len "default") (return KW-COLOR))
+  (when (str-eq-lit len "typedef") (return KW-COLOR))
+  (when (str-eq-lit len "continue") (return KW-COLOR))
+  (when (str-eq-lit len "register") (return KW-COLOR))
+  (when (str-eq-lit len "restrict") (return KW-COLOR))
+  (when (str-eq-lit len "volatile") (return KW-COLOR))
+  ; --- C types (blue) ---
+  (when (str-eq-lit len "int") (return TYPE-COLOR))
+  (when (str-eq-lit len "bool") (return TYPE-COLOR))
+  (when (str-eq-lit len "char") (return TYPE-COLOR))
+  (when (str-eq-lit len "long") (return TYPE-COLOR))
+  (when (str-eq-lit len "void") (return TYPE-COLOR))
+  (when (str-eq-lit len "float") (return TYPE-COLOR))
+  (when (str-eq-lit len "short") (return TYPE-COLOR))
+  (when (str-eq-lit len "double") (return TYPE-COLOR))
+  (when (str-eq-lit len "signed") (return TYPE-COLOR))
+  (when (str-eq-lit len "size_t") (return TYPE-COLOR))
+  (when (str-eq-lit len "int8_t") (return TYPE-COLOR))
+  (when (str-eq-lit len "_Atomic") (return TYPE-COLOR))
+  (when (str-eq-lit len "ssize_t") (return TYPE-COLOR))
+  (when (str-eq-lit len "int16_t") (return TYPE-COLOR))
+  (when (str-eq-lit len "int32_t") (return TYPE-COLOR))
+  (when (str-eq-lit len "int64_t") (return TYPE-COLOR))
+  (when (str-eq-lit len "unsigned") (return TYPE-COLOR))
+  (when (str-eq-lit len "uint8_t") (return TYPE-COLOR))
+  (when (str-eq-lit len "uint16_t") (return TYPE-COLOR))
+  (when (str-eq-lit len "uint32_t") (return TYPE-COLOR))
+  (when (str-eq-lit len "uint64_t") (return TYPE-COLOR))
+  (when (str-eq-lit len "intptr_t") (return TYPE-COLOR))
+  (when (str-eq-lit len "_Bool") (return TYPE-COLOR))
+  (when (str-eq-lit len "_Complex") (return TYPE-COLOR))
+  (when (str-eq-lit len "uintptr_t") (return TYPE-COLOR))
+  (return 0))
+
+; Match Python keywords → KW-COLOR(35), builtins → TYPE-COLOR(34), else 0
+(fn py-match-keyword (len)
+  ; --- Python keywords (magenta) ---
+  (when (str-eq-lit len "if") (return KW-COLOR))
+  (when (str-eq-lit len "in") (return KW-COLOR))
+  (when (str-eq-lit len "is") (return KW-COLOR))
+  (when (str-eq-lit len "or") (return KW-COLOR))
+  (when (str-eq-lit len "as") (return KW-COLOR))
+  (when (str-eq-lit len "and") (return KW-COLOR))
+  (when (str-eq-lit len "def") (return KW-COLOR))
+  (when (str-eq-lit len "del") (return KW-COLOR))
+  (when (str-eq-lit len "for") (return KW-COLOR))
+  (when (str-eq-lit len "not") (return KW-COLOR))
+  (when (str-eq-lit len "try") (return KW-COLOR))
+  (when (str-eq-lit len "elif") (return KW-COLOR))
+  (when (str-eq-lit len "else") (return KW-COLOR))
+  (when (str-eq-lit len "from") (return KW-COLOR))
+  (when (str-eq-lit len "pass") (return KW-COLOR))
+  (when (str-eq-lit len "with") (return KW-COLOR))
+  (when (str-eq-lit len "True") (return KW-COLOR))
+  (when (str-eq-lit len "None") (return KW-COLOR))
+  (when (str-eq-lit len "break") (return KW-COLOR))
+  (when (str-eq-lit len "class") (return KW-COLOR))
+  (when (str-eq-lit len "raise") (return KW-COLOR))
+  (when (str-eq-lit len "while") (return KW-COLOR))
+  (when (str-eq-lit len "yield") (return KW-COLOR))
+  (when (str-eq-lit len "False") (return KW-COLOR))
+  (when (str-eq-lit len "async") (return KW-COLOR))
+  (when (str-eq-lit len "await") (return KW-COLOR))
+  (when (str-eq-lit len "except") (return KW-COLOR))
+  (when (str-eq-lit len "global") (return KW-COLOR))
+  (when (str-eq-lit len "import") (return KW-COLOR))
+  (when (str-eq-lit len "lambda") (return KW-COLOR))
+  (when (str-eq-lit len "return") (return KW-COLOR))
+  (when (str-eq-lit len "assert") (return KW-COLOR))
+  (when (str-eq-lit len "finally") (return KW-COLOR))
+  (when (str-eq-lit len "nonlocal") (return KW-COLOR))
+  (when (str-eq-lit len "continue") (return KW-COLOR))
+  ; --- Python builtins (blue) ---
+  (when (str-eq-lit len "int") (return TYPE-COLOR))
+  (when (str-eq-lit len "str") (return TYPE-COLOR))
+  (when (str-eq-lit len "len") (return TYPE-COLOR))
+  (when (str-eq-lit len "list") (return TYPE-COLOR))
+  (when (str-eq-lit len "dict") (return TYPE-COLOR))
+  (when (str-eq-lit len "type") (return TYPE-COLOR))
+  (when (str-eq-lit len "bool") (return TYPE-COLOR))
+  (when (str-eq-lit len "set") (return TYPE-COLOR))
+  (when (str-eq-lit len "map") (return TYPE-COLOR))
+  (when (str-eq-lit len "zip") (return TYPE-COLOR))
+  (when (str-eq-lit len "any") (return TYPE-COLOR))
+  (when (str-eq-lit len "all") (return TYPE-COLOR))
+  (when (str-eq-lit len "abs") (return TYPE-COLOR))
+  (when (str-eq-lit len "min") (return TYPE-COLOR))
+  (when (str-eq-lit len "max") (return TYPE-COLOR))
+  (when (str-eq-lit len "sum") (return TYPE-COLOR))
+  (when (str-eq-lit len "open") (return TYPE-COLOR))
+  (when (str-eq-lit len "self") (return TYPE-COLOR))
+  (when (str-eq-lit len "super") (return TYPE-COLOR))
+  (when (str-eq-lit len "print") (return TYPE-COLOR))
+  (when (str-eq-lit len "range") (return TYPE-COLOR))
+  (when (str-eq-lit len "tuple") (return TYPE-COLOR))
+  (when (str-eq-lit len "float") (return TYPE-COLOR))
+  (when (str-eq-lit len "bytes") (return TYPE-COLOR))
+  (when (str-eq-lit len "input") (return TYPE-COLOR))
+  (when (str-eq-lit len "isinstance") (return TYPE-COLOR))
+  (when (str-eq-lit len "enumerate") (return TYPE-COLOR))
+  (return 0))
+
+; Check if word at pos is a Python keyword; sets g-kw-remaining/g-kw-color
+(fn py-keyword-check (pos)
+  (let len (read-word-len pos))
+  (when (<= len 1) (return 0))
+  (let c (py-match-keyword len))
+  (when (> c 0)
+    (global-set! g-kw-remaining (- len 1))
+    (global-set! g-kw-color c))
+  (return c))
+
+; Check if word at pos is a C keyword; sets g-kw-remaining/g-kw-color
+(fn c-keyword-check (pos)
+  (let len (read-word-len pos))
+  (when (<= len 1) (return 0))
+  (let c (c-match-keyword len))
+  (when (> c 0)
+    (global-set! g-kw-remaining (- len 1))
+    (global-set! g-kw-color c))
+  (return c))
+
+; ---------------------------------------------------------------------------
+; draw-start — called before draw loop, sets initial fg from view state
+; ---------------------------------------------------------------------------
+
+(fn-c cfg-draw-start () -> void
+  (global-set! g-section g-view-state)
+  (global-set! g-depth -1)
+  (global-set! g-kw-remaining 0)
+  (global-set! g-prev-word 0)
+  (global-set! g-ft (api get-file-type))
+  ; Set initial color based on view state (computed by cfg-compute-vs)
+  (if (== g-section SEC-STRING)  (api do-set-color STRING-COLOR)
+  (if (== g-section SEC-BLOCK)   (api do-set-color COMMENT-COLOR)
+  (if (== g-section SEC-LINE)    (api do-set-color COMMENT-COLOR)
+  (if (== g-section SEC-TRISTR)  (api do-set-color STRING-COLOR)
+                                 (api do-set-color TEXT-COLOR))))))
+
+; ---------------------------------------------------------------------------
+; draw-char — per-character syntax highlighting
+; Returns fg color or -1 for no change
+; ---------------------------------------------------------------------------
+
+(fn-c cfg-draw-char ((int64_t pos) (int64_t cp)) -> int64_t
+  (let ft g-ft)
+  ; No highlighting for unknown file types
+  (when (== ft FT-NONE) (return -1))
+
+  ; Line comment → newline exits
+  (when (== g-section SEC-LINE)
+    (when (== cp #\newline)
+      (global-set! g-section SEC-NONE)
+      (return TEXT-COLOR))
+    (return COMMENT-COLOR))
+
+  ; Block comment → check end marker (trigger on second char of end marker)
+  (when (== g-section SEC-BLOCK)
+    ; Scheme: |# ends block comment (prev=| current=#)
+    (when (&& (== ft FT-SCHEME) (&& (== cp #\#) (== (prev-byte pos) #\|)))
+      (global-set! g-section SEC-NONE)
+      (return COMMENT-COLOR))
+    ; C: */ ends block comment (prev=* current=/)
+    (when (&& (== ft FT-C) (&& (== cp #\/) (== (prev-byte pos) #\*)))
+      (global-set! g-section SEC-NONE)
+      (return COMMENT-COLOR))
+    (return COMMENT-COLOR))
+
+  ; Triple-quote string → check for closing triple-quote
+  (when (== g-section SEC-TRISTR)
+    (when (== cp g-tri-quote)
+      (let tq (triple-quote? pos cp))
+      (when (> tq 0)
+        (global-set! g-section SEC-NONE)
+        ; skip the 2nd and 3rd quotes via kw-remaining trick
+        (global-set! g-kw-remaining 2)
+        (global-set! g-kw-color STRING-COLOR)))
+    (return STRING-COLOR))
+
+  ; String → unescaped matching quote exits
+  (when (== g-section SEC-STRING)
+    (when (&& (== cp g-str-quote)
+              (! (escaped? pos)))
+      (global-set! g-section SEC-NONE)
+      (return STRING-COLOR))
+    (return STRING-COLOR))
+
+  ; --- Normal mode (section == SEC-NONE) ---
+
+  ; Keyword highlight continuation (chars 2..N of a matched keyword)
+  (when (> g-kw-remaining 0)
+    (dec! g-kw-remaining)
+    (return g-kw-color))
+
+  ; Triple-quote open (Python) — must check before regular string open
+  (when (== ft FT-PYTHON)
+    (let tq (triple-quote? pos cp))
+    (when (> tq 0)
+      (global-set! g-section SEC-TRISTR)
+      (global-set! g-tri-quote tq)
+      (global-set! g-kw-remaining 2)
+      (global-set! g-kw-color STRING-COLOR)
+      (return STRING-COLOR)))
+
+  ; String open: " for all languages
+  (when (&& (== cp #\") (! (escaped? pos)))
+    (global-set! g-str-quote #\")
+    (global-set! g-section SEC-STRING)
+    (return STRING-COLOR))
+
+  ; String open: ' for Python
+  (when (&& (== ft FT-PYTHON) (&& (== cp #\') (! (escaped? pos))))
+    (global-set! g-str-quote #\')
+    (global-set! g-section SEC-STRING)
+    (return STRING-COLOR))
+
+  ; Line comment: ; for Scheme (but not #;)
+  (when (&& (== ft FT-SCHEME) (== cp #\;))
+    (when (!= (prev-byte pos) #\#)
+      (global-set! g-section SEC-LINE)
+      (return COMMENT-COLOR)))
+
+  ; Line comment: // for C
+  (when (&& (== ft FT-C) (&& (== cp #\/) (== (next-byte pos) #\/)))
+    (global-set! g-section SEC-LINE)
+    (return COMMENT-COLOR))
+
+  ; Line comment: # for Python
+  (when (&& (== ft FT-PYTHON) (== cp #\#))
+    (global-set! g-section SEC-LINE)
+    (return COMMENT-COLOR))
+
+  ; Block comment: #| for Scheme
+  (when (&& (== ft FT-SCHEME) (&& (== cp #\#) (== (next-byte pos) #\|)))
+    (global-set! g-section SEC-BLOCK)
+    (return COMMENT-COLOR))
+
+  ; Block comment: /* for C
+  (when (&& (== ft FT-C) (&& (== cp #\/) (== (next-byte pos) #\*)))
+    (global-set! g-section SEC-BLOCK)
+    (return COMMENT-COLOR))
+
+  ; C keyword detection at word start
+  (when (== ft FT-C)
+    (when (&& (|| (alpha? cp) (== cp #\_))
+              (! g-prev-word))
+      (let kc (c-keyword-check pos))
+      (when (> kc 0)
+        (global-set! g-prev-word 1)
+        (return kc))))
+
+  ; Python keyword detection at word start
+  (when (== ft FT-PYTHON)
+    (when (&& (|| (alpha? cp) (== cp #\_))
+              (! g-prev-word))
+      (let kc (py-keyword-check pos))
+      (when (> kc 0)
+        (global-set! g-prev-word 1)
+        (return kc))))
+
+  ; Track word-char state for next iteration
+  (global-set! g-prev-word (word-char? cp))
+
+  ; Rainbow parens
+  (when (open-paren? cp)
+    (inc! g-depth)
+    (return (paren-color g-depth)))
+
+  (when (close-paren? cp)
+    (let c (paren-color g-depth))
+    (when (>= g-depth 0) (dec! g-depth))
+    (return c))
+
+  ; Default: reset to text color
+  (return TEXT-COLOR))
+
+; ---------------------------------------------------------------------------
+; draw-end — reset paren depth for next draw
+; ---------------------------------------------------------------------------
+
+(fn-c cfg-draw-end () -> void
+  (global-set! g-depth -1))
+
+; ---------------------------------------------------------------------------
+; compute-view-state — scan from 0 to view-start physical position
+; Returns: 0=none, 1=string, 2=block-comment
+; ---------------------------------------------------------------------------
+
+; Inner scan loop — shared by full and incremental paths
+
+(fn cp-get (idx)
+  (let off (* idx 8))
+  (let addr (+ g-cp-states off))
+  (return (get addr 0 8)))
+
+(fn cp-set (idx val)
+  (let off (* idx 8))
+  (let addr (+ g-cp-states off))
+  (set! addr 0 8 val))
+
+; Scan state — shared by vs-scan-cp/phys-to-log/log-to-phys
+; (globals to stay under Anchor's ~5 param limit per function)
+(global g-vs-ft  0)  ; FT-NONE
+(global g-vs-bs  0)
+(global g-vs-gs  0)
+(global g-vs-ge  0)
+
+; Convert physical position to logical (gap-independent)
+(fn phys-to-log (phys)
+  (when (< phys g-vs-gs) (return phys))
+  (when (>= phys g-vs-ge) (return (- phys (- g-vs-ge g-vs-gs))))
+  ; Inside gap — shouldn't happen, treat as gap-start
+  (return g-vs-gs))
+
+; Convert logical position to physical
+(fn log-to-phys (logp)
+  (when (< logp g-vs-gs) (return logp))
+  (return (+ logp (- g-vs-ge g-vs-gs))))
+
+; Scan with checkpoint saving — checkpoints indexed by LOGICAL position
+(fn vs-scan-cp (state i vsphys last-cp)
+  (let ft g-vs-ft) (let bs g-vs-bs)
+  (let gs g-vs-gs) (let ge g-vs-ge)
+  ; Precompute physical position of next checkpoint boundary
+  (let next-cp-phys (log-to-phys (* (+ last-cp 1) CP-INTERVAL)))
+  (while (< i vsphys)
+    ; skip gap
+    (when (&& (>= i gs) (< i ge)) (set! i ge))
+    (when (>= i vsphys) (return state))
+    (when (>= i bs) (return state))
+
+    ; Save checkpoint when crossing a boundary (cheap integer compare)
+    (when (>= i next-cp-phys)
+      (let cur-cp (+ last-cp 1))
+      (when (< cur-cp CP-MAX)
+        (cp-set cur-cp state)
+        (when (> cur-cp g-cp-high)
+          (global-set! g-cp-high cur-cp))
+        (set! last-cp cur-cp)
+        (set! next-cp-phys (log-to-phys (* (+ cur-cp 1) CP-INTERVAL)))))
+
+    (let cp (api do-utf8-ref i))
+
+    (if (== state SEC-LINE)
+      (when (== cp #\newline) (set! state SEC-NONE))
+
+    (if (== state SEC-BLOCK)
+      (do
+        (when (&& (== ft FT-SCHEME) (&& (== cp #\#) (== (prev-byte i) #\|)))
+          (set! state SEC-NONE))
+        (when (&& (== ft FT-C) (&& (== cp #\/) (== (prev-byte i) #\*)))
+          (set! state SEC-NONE)))
+
+    (if (== state SEC-TRISTR)
+      (when (== cp g-tri-quote)
+        (when (> (triple-quote? i cp) 0)
+          (set! state SEC-NONE)))
+
+    (if (== state SEC-STRING)
+      (when (&& (== cp g-str-quote)
+                (! (escaped? i)))
+        (set! state SEC-NONE))
+
+      (do
+        ; Triple-quote open (Python) — check before regular string
+        (when (== ft FT-PYTHON)
+          (let tq (triple-quote? i cp))
+          (when (> tq 0)
+            (global-set! g-tri-quote tq)
+            (set! state SEC-TRISTR)))
+        ; Regular string open: " (all languages)
+        (when (&& (== state SEC-NONE) (&& (== cp #\") (! (escaped? i))))
+          (global-set! g-str-quote #\")
+          (set! state SEC-STRING))
+        ; String open: ' (Python only)
+        (when (&& (== state SEC-NONE)
+                  (&& (== ft FT-PYTHON) (&& (== cp #\') (! (escaped? i)))))
+          (global-set! g-str-quote #\')
+          (set! state SEC-STRING))
+        ; Line comment: ; for Scheme (but not #;)
+        (when (&& (== state SEC-NONE) (&& (== ft FT-SCHEME) (== cp #\;)))
+          (when (!= (prev-byte i) #\#)
+            (set! state SEC-LINE)))
+        ; Line comment: // for C
+        (when (&& (== state SEC-NONE)
+                  (&& (== ft FT-C) (&& (== cp #\/) (== (next-byte i) #\/))))
+          (set! state SEC-LINE))
+        ; Line comment: # for Python
+        (when (&& (== state SEC-NONE)
+                  (&& (== ft FT-PYTHON) (== cp #\#)))
+          (set! state SEC-LINE))
+        ; Block comment: #| for Scheme
+        (when (&& (== state SEC-NONE)
+                  (&& (== ft FT-SCHEME) (&& (== cp #\#) (== (next-byte i) #\|))))
+          (set! state SEC-BLOCK))
+        ; Block comment: /* for C
+        (when (&& (== state SEC-NONE)
+                  (&& (== ft FT-C) (&& (== cp #\/) (== (next-byte i) #\*))))
+          (set! state SEC-BLOCK)))))))
+
+    ; Advance by UTF-8 byte size
+    (let b (api do-gbyte i))
+    (if (< b 0x80) (inc! i)
+    (if (< b 0xE0) (inc-by! i 2)
+    (if (< b 0xF0) (inc-by! i 3)
+                    (inc-by! i 4)))))
+  (return state))
+
+(fn-c cfg-compute-vs ((int64_t vsphys)) -> int64_t
+  (let ft (api get-file-type))
+  (when (== ft FT-NONE) (return SEC-NONE))
+  (global-set! g-vs-ft ft)
+  (let bs (api get-buf-size))
+  (global-set! g-vs-bs bs)
+  (global-set! g-vs-gs (api get-gap-start))
+  (global-set! g-vs-ge (api get-gap-end))
+
+  ; Invalidate checkpoints only when content changes (buf-size changes)
+  (when (!= g-cp-bs bs)
+    (global-set! g-cp-high -1)
+    (global-set! g-cp-bs bs))
+
+  ; Convert vsphys to logical for checkpoint lookup
+  (let vs-log (phys-to-log vsphys))
+  (let target-cp (/ vs-log CP-INTERVAL))
+  (when (>= target-cp CP-MAX) (set! target-cp (- CP-MAX 1)))
+
+  ; Find best starting point from checkpoints
+  (let state 0)
+  (let start 0)
+  (when (>= g-cp-high 0)
+    (let ci (if (< target-cp g-cp-high) target-cp g-cp-high))
+    (set! state (cp-get ci))
+    ; Convert checkpoint's logical position back to physical
+    (set! start (log-to-phys (* ci CP-INTERVAL))))
+
+  ; Scan from start to vsphys, saving checkpoints along the way
+  (let last-cp (/ (phys-to-log start) CP-INTERVAL))
+  (let scan-state (vs-scan-cp state start vsphys last-cp))
+  (global-set! g-view-state scan-state)
+  (return scan-state))
+
+; ---------------------------------------------------------------------------
+; Scheme indent — scan backward for matching open paren
+; ---------------------------------------------------------------------------
+
+(fn scheme-indent ()
+  (let depth 0)
+  (let ge (api get-gap-end))
+  (let i (api do-back-char ge))
+  (let max-scan 2000)
+  (while (&& (> i 0) (> max-scan 0))
+    (let cp (api do-utf8-ref i))
+    (if (open-paren? cp)
+      (do
+        (when (== depth 0)
+          (let ls (api do-line-start i))
+          (let col 0)
+          (let li ls)
+          (while (< li i)
+            (inc-by! col (api do-col-width (api do-utf8-ref li)))
+            (set! li (api do-fwd-char li)))
+          ; If quote/backtick/@ before paren, or nested open paren after → col+1
+          (let prev-cp (api do-utf8-ref (api do-back-char i)))
+          (let next-cp (api do-utf8-ref (api do-fwd-char i)))
+          (if (|| (quoted-char? prev-cp) (open-paren? next-cp))
+            (return (+ col 1))
+            (return (+ col (api get-tab-size)))))
+        (dec! depth))
+      (when (close-paren? cp)
+        (inc! depth)))
+    (set! i (api do-back-char i))
+    (dec! max-scan))
+  ; Edge case: open paren at position 0 at depth 0
+  (when (== depth 0)
+    (when (open-paren? (api do-utf8-ref 0))
+      (return (api get-tab-size))))
+  (return 0))
+
+; ---------------------------------------------------------------------------
+; C indent — scan backward for { or ( at depth 0
+; ---------------------------------------------------------------------------
+
+(fn c-indent ()
+  (let depth 0)
+  (let i (api do-back-char (api get-gap-end)))
+  (let max-scan 2000)
+  (while (&& (> i 0) (> max-scan 0))
+    (let cp (api do-utf8-ref i))
+    (if (|| (== cp #\{) (== cp #\())
+      (do
+        (when (== depth 0)
+          (let ls (api do-line-start i))
+          (let li ls)
+          (let lc 0)
+          (while (&& (< li i)
+                     (|| (== (api do-utf8-ref li) #\space)
+                         (== (api do-utf8-ref li) #\tab)))
+            (inc-by! lc (api do-col-width (api do-utf8-ref li)))
+            (set! li (api do-fwd-char li)))
+          (return (+ lc (api get-tab-size))))
+        (dec! depth))
+      (when (|| (== cp #\}) (== cp #\)))
+        (inc! depth)))
+    (set! i (api do-back-char i))
+    (dec! max-scan))
+  (return 0))
+
+; ---------------------------------------------------------------------------
+; Python indent — match previous line indent; add tab-size after ':'
+; ---------------------------------------------------------------------------
+
+(fn py-indent ()
+  ; Scan backward to find current line's leading indent
+  (let ge (api get-gap-end))
+  (let i (api do-back-char ge))
+  ; Find start of previous line (skip back past any trailing whitespace/newline)
+  (while (&& (> i 0) (|| (== (api do-utf8-ref i) #\space)
+                          (|| (== (api do-utf8-ref i) #\newline)
+                              (== (api do-utf8-ref i) #\tab))))
+    (set! i (api do-back-char i)))
+  ; i is now at last non-whitespace char before cursor
+  (let last-char (api do-utf8-ref i))
+  ; Find start of this line
+  (let ls (api do-line-start i))
+  ; Count leading indent
+  (let col 0)
+  (let li ls)
+  (while (&& (< li i)
+             (|| (== (api do-utf8-ref li) #\space)
+                 (== (api do-utf8-ref li) #\tab)))
+    (inc-by! col (api do-col-width (api do-utf8-ref li)))
+    (set! li (api do-fwd-char li)))
+  ; If line ended with ':', add one indent level
+  (when (== last-char #\:)
+    (return (+ col (api get-tab-size))))
+  (return col))
+
+; ---------------------------------------------------------------------------
+; on-newline — auto-indent based on file type
+; Returns indent column count, or -1 for default behavior
+; ---------------------------------------------------------------------------
+
+(fn-c cfg-on-newline () -> int64_t
+  (let ft (api get-file-type))
+  (when (== ft FT-NONE)   (return -1))
+  (when (== ft FT-SCHEME) (return (scheme-indent)))
+  (when (== ft FT-PYTHON) (return (py-indent)))
+  (return (c-indent)))
+
+; ---------------------------------------------------------------------------
+; on-key — custom keybindings
+; Returns 1 if handled, 0 otherwise
+; ---------------------------------------------------------------------------
+
+(fn-c cfg-on-key ((int64_t type) (int64_t key)
+                   (int64_t p0) (int64_t p1) (int64_t p2)) -> int64_t
+  ; Ctrl-W: visual save (flash bg then write)
+  (when (&& (== type 0) (== key 23))
+    (api do-set-bg-color 40)    ; black bg flash
+    (api do-render)
+    (api do-write-file)
+    (usleep 100000)              ; 100ms flash
+    (api do-set-bg-color 49)    ; restore default bg
+    (return 1))
+  (return 0))
+
+; ---------------------------------------------------------------------------
+; buged_init — plugin entry point, called by editor after dlopen
+; ---------------------------------------------------------------------------
+
+(fn-c buged_init ((void* api)) -> void
+  (global-set! g-api api)
+  ; Set editor defaults
+  (api do-set-tab-size 4)
+  (api do-set-text-color TEXT-COLOR)
+  ; Register all callbacks
+  (api reg-draw-start  (fn-ptr cfg-draw-start))
+  (api reg-draw-char   (fn-ptr cfg-draw-char))
+  (api reg-draw-end    (fn-ptr cfg-draw-end))
+  (api reg-on-key      (fn-ptr cfg-on-key))
+  (api reg-on-newline  (fn-ptr cfg-on-newline))
+  (api reg-compute-vs  (fn-ptr cfg-compute-vs)))
+
