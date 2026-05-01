@@ -152,7 +152,18 @@
 
 (fn escaped? (pos)
   (when (<= pos 0) (return 0))
-  (return (== (prev-byte pos) #\\)))
+  (when (!= (prev-byte pos) #\\) (return 0))
+  (let count 1)
+  (let p (api do-back-char pos))
+  (when (<= p 0) (return 1))
+  (while 1
+    (when (<= p 0) (break))
+    (let prev (api do-back-char p))
+    (when (>= prev p) (break))
+    (when (!= (api do-gbyte prev) #\\) (break))
+    (set! count (+ count 1))
+    (set! p prev))
+  (return (% count 2)))
 
 (fn paren-color (d)
   (when (< d 0) (return TEXT-COLOR))
