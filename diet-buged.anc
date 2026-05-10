@@ -211,17 +211,17 @@
 ; ---------------------------------------------------------------------------
 
 ; Terminal saved/raw termios and winsize (static storage)
-(global g-tios    (alloc 80))   ; saved termios (>= 72 bytes)
-(global g-raw-tios (alloc 80))  ; raw-mode termios
-(global g-winsz   (alloc 8))
-(global g-pfd     (alloc 8))    ; PollFd for escape-sequence peek
+(global g-tios    (array-of 80))   ; saved termios (>= 72 bytes)
+(global g-raw-tios (array-of 80))  ; raw-mode termios
+(global g-winsz   (array-of 8))
+(global g-pfd     (array-of 8))    ; PollFd for escape-sequence peek
 
 ; Output buffer flushed each render frame
-(global g-out      (alloc (kb 256)))
+(global g-out      (array-of (kb 256)))
 (global g-out-len  0)
 
 ; File name
-(global g-fname     (alloc (kb 4)))
+(global g-fname     (array-of (kb 4)))
 (global g-fname-len 0)
 
 ; Gap buffer (data is malloc'd; all other fields are plain globals)
@@ -234,8 +234,8 @@
 ; Undo ring — circular buffer with three pointers:
 ;   oldest → top = valid entries, point = undo read head
 ; Data pool is linear; when full, evict oldest entries until room.
-(global g-undo-ring  (alloc (kb 128)))  ; 4096 entries × 32 bytes
-(global g-undo-data  (alloc (kb 512)))  ; pool for deleted bytes
+(global g-undo-ring  (array-of (kb 128)))  ; 4096 entries × 32 bytes
+(global g-undo-data  (array-of (kb 512)))  ; pool for deleted bytes
 (global g-undo-top     0)              ; write head — next slot to write
 (global g-undo-point   0)              ; read head — next slot to undo
 (global g-undo-oldest  0)              ; oldest valid entry
@@ -261,11 +261,11 @@
 (global g-bg-color   49)   ; ANSI: default bg
 (global g-text-color 39)   ; ANSI: default fg
 (global g-file-type  0)    ; 0=none 1=scheme 2=c
-(global g-search-buf (alloc 4096))
+(global g-search-buf (array-of 4096))
 (global g-search-len 0)
 
 ; Config .dylib
-(global g-config-api (alloc (sizeof EditorAPI)))
+(global g-config-api (array-of (sizeof EditorAPI)))
 (global g-config-handle 0)         ; dlopen handle
 
 ; Plugin callbacks (set by config via API registration)
@@ -280,14 +280,14 @@
 (global g-view-state     0)
 
 ; 1-byte read buffer — reused by read-byte to avoid arena growth per keystroke
-(global g-read1 (alloc 1))
+(global g-read1 (array-of 1))
 
 ; ---------------------------------------------------------------------------
 ; SIGWINCH handler (fn-c = C calling convention, callable by signal())
 ; ---------------------------------------------------------------------------
 
 (fn-c sigwinch-handler ((int sig)) -> void
-  (global-set! g-resized 1))
+  (set! g-resized 1))
 
 ; ---------------------------------------------------------------------------
 ; Output buffer helpers
@@ -328,7 +328,7 @@
 
 (fn flush-out ()
   (write (c-const STDOUT_FILENO)g-out g-out-len)
-  (global-set! g-out-len 0))
+  (set! g-out-len 0))
 
 ; ---------------------------------------------------------------------------
 ; Screen commands
@@ -404,8 +404,8 @@
 
 (fn term-get-size ()
   (ioctl (c-const STDOUT_FILENO)(c-const TIOCGWINSZ) g-winsz)
-  (global-set! g-rows (get g-winsz WinSize rows))
-  (global-set! g-cols (get g-winsz WinSize cols)))
+  (set! g-rows (get g-winsz WinSize rows))
+  (set! g-cols (get g-winsz WinSize cols)))
 
 ; ---------------------------------------------------------------------------
 ; View-start conversions (g-view-start is LOGICAL, like Scheme)
@@ -456,12 +456,12 @@
   (let new-end  (+ g-gap-end INIT-GAP))
   (let tail-len (- g-buf-size g-gap-end))
   (let new-data (realloc g-data new-size))
-  (global-set! g-data new-data)
+  (set! g-data new-data)
   (memmove (+ g-data new-end)
            (+ g-data g-gap-end)
            tail-len)
-  (global-set! g-gap-end new-end)
-  (global-set! g-buf-size new-size))
+  (set! g-gap-end new-end)
+  (set! g-buf-size new-size))
 
 ; Whitespace test (space, newline, tab)
 (fn ws? (cp) (return (|| (== cp #\space) (|| (== cp #\newline) (== cp #\tab)))))
@@ -655,20 +655,20 @@
   (when (== (- g-undo-top g-undo-oldest) UNDO-CAP)
     (inc! g-undo-oldest)
     (when (< g-undo-point g-undo-oldest)
-      (global-set! g-undo-point g-undo-oldest))))
+      (set! g-undo-point g-undo-oldest))))
 
 ; Advance oldest entries until byte-count bytes are free in data pool
 (fn undo-evict-data (byte-count)
   (while (> (+ g-undo-pool-top byte-count) UNDO-DATA-CAP)
     (when (== g-undo-oldest g-undo-top)
       ; No entries left to evict — reset pool
-      (global-set! g-undo-pool-top 0)
+      (set! g-undo-pool-top 0)
       (return 0))
     (let old (undo-slot g-undo-oldest))
     ; Reclaim data if this was a delete entry
     (when (== (get old UndoEntry type) 1)
       (let old-end (+ (get old UndoEntry data-off) (get old UndoEntry len)))
-      (global-set! g-undo-pool-top (- g-undo-pool-top old-end))
+      (set! g-undo-pool-top (- g-undo-pool-top old-end))
       ; Shift remaining data down
       (memmove g-undo-data (+ g-undo-data old-end) g-undo-pool-top)
       ; Adjust data-off for all newer delete entries
@@ -680,7 +680,7 @@
         (inc! k)))
     (inc! g-undo-oldest)
     (when (< g-undo-point g-undo-oldest)
-      (global-set! g-undo-point g-undo-oldest))))
+      (set! g-undo-point g-undo-oldest))))
 
 ; Push type=0 entry (was-insert of n bytes, undo = delete n bytes)
 (fn undo-push-insert (n)
@@ -691,7 +691,7 @@
   (set! slot UndoEntry data-off 0)
   (set! slot UndoEntry len n)
   (inc! g-undo-top)
-  (unless g-undoing (global-set! g-undo-point g-undo-top)))
+  (unless g-undoing (set! g-undo-point g-undo-top)))
 
 ; Push type=1 entry (was-delete of bytes at src, undo = insert bytes)
 (fn undo-push-delete (src byte-count)
@@ -708,7 +708,7 @@
   (set! slot UndoEntry len      byte-count)
   (inc-by! g-undo-pool-top byte-count)
   (inc! g-undo-top)
-  (unless g-undoing (global-set! g-undo-point g-undo-top)))
+  (unless g-undoing (set! g-undo-point g-undo-top)))
 
 ; ---------------------------------------------------------------------------
 ; Insert / Delete
@@ -766,13 +766,13 @@
 
 (fn undo ()
   (when (<= g-undo-point g-undo-oldest) (return 0))
-  (global-set! g-undoing 1)
+  (set! g-undoing 1)
   (dec! g-undo-point)
   (let slot (undo-slot g-undo-point))
   (let pos  (get slot UndoEntry pos))
   (let typ  (get slot UndoEntry type))
   (let len  (get slot UndoEntry len))
-  (global-set! g-mark -1)
+  (set! g-mark -1)
   ; pos is a logical position — convert to physical if past gap
   (let phys (if (> pos g-gap-start) (+ pos (- g-gap-end g-gap-start)) pos))
   (if (== typ 0)
@@ -786,7 +786,7 @@
       (let data-off (get slot UndoEntry data-off))
       (ins-bytes (+ g-undo-data data-off) len)
       (undo-push-insert len)))
-  (global-set! g-undoing 0))
+  (set! g-undoing 0))
 
 ; ---------------------------------------------------------------------------
 ; Search
@@ -801,15 +801,15 @@
       (let pat-len (- g-gap-start g-mark))
       (when (> pat-len 4095) (set! pat-len 4095))
       (memcpy g-search-buf (+ g-data g-mark) pat-len)
-      (global-set! g-search-len pat-len))
+      (set! g-search-len pat-len))
     (do
       ; Selection after cursor — bytes are at [gap-end, gap-end + (mark - gap-start))
       (let pat-len (- g-mark g-gap-start))
       (when (> pat-len 4095) (set! pat-len 4095))
       (memcpy g-search-buf (+ g-data g-gap-end) pat-len)
-      (global-set! g-search-len pat-len)))
+      (set! g-search-len pat-len)))
   (del-range g-mark g-gap-start)
-  (global-set! g-mark -1))
+  (set! g-mark -1))
 
 ; Match search pattern at physical position p; return 1 if match
 (fn search-match-at (p)
@@ -833,7 +833,7 @@
     (skip-gap! p)
     (when (search-match-at p)
       (gap-move p)
-      (unless keep-mark (global-set! g-mark g-gap-start))
+      (unless keep-mark (set! g-mark g-gap-start))
       ; After gap-move(p), matched bytes are now at g-gap-end
       (gap-move (+ g-gap-end g-search-len))
       (return 1))
@@ -854,7 +854,7 @@
     (when (search-match-at p)
       ; Cursor stays at match start; mark at match end (logical = p + search-len)
       (gap-move p)
-      (unless keep-mark (global-set! g-mark (+ g-gap-start g-search-len)))
+      (unless keep-mark (set! g-mark (+ g-gap-start g-search-len)))
       (return 1))
     (dec! p))
   (return 0))
@@ -886,7 +886,7 @@
   (while (> c 0)
     (set! i (line-start-vis (back-char (line-start-vis i))))
     (dec! c))
-  (global-set! g-view-start (bound-idx i)))
+  (set! g-view-start (bound-idx i)))
 
 (fn check-view ()
   ; g-view-start is logical (like Scheme)
@@ -948,7 +948,7 @@
 
   ; Compute view state for syntax highlighting
   (when g-cb-compute-vs
-    (global-set! g-view-state
+    (set! g-view-state
       (call-ptr-c g-cb-compute-vs ((int64_t) -> int64_t) p)))
 
   ; Plugin draw-start hook (sets initial fg color from view state)
@@ -1024,15 +1024,15 @@
   (let p (cwgs g-view-start)) (let row 0) (let col 0)
   (while (< p g-buf-size)
     (when (>= p g-gap-start)
-      (global-set! g-cursor-row row)
-      (global-set! g-cursor-col col)
+      (set! g-cursor-row row)
+      (set! g-cursor-col col)
       (return 0))
     (let cp (utf8-ref-phys p))
     (let w (col-width cp))
     (advance-pos! row col cp w)
     (inc-by! p (utf8-size (gbyte p))))
-  (global-set! g-cursor-row row)
-  (global-set! g-cursor-col col)
+  (set! g-cursor-row row)
+  (set! g-cursor-col col)
   (return 0))
 
 (fn render ()
@@ -1049,12 +1049,12 @@
 ; ---------------------------------------------------------------------------
 
 (fn set-esc-param (idx val)
-  (if (== idx 0) (global-set! g-esc-p0 val)
-  (if (== idx 1) (global-set! g-esc-p1 val)
-  (if (== idx 2) (global-set! g-esc-p2 val)
-  (if (== idx 3) (global-set! g-esc-p3 val)
-  (if (== idx 4) (global-set! g-esc-p4 val)
-                  (global-set! g-esc-p5 val)))))))
+  (if (== idx 0) (set! g-esc-p0 val)
+  (if (== idx 1) (set! g-esc-p1 val)
+  (if (== idx 2) (set! g-esc-p2 val)
+  (if (== idx 3) (set! g-esc-p3 val)
+  (if (== idx 4) (set! g-esc-p4 val)
+                  (set! g-esc-p5 val)))))))
 
 ; Read one byte from stdin into static buffer; returns byte value
 (fn read-byte ()
@@ -1080,30 +1080,30 @@
   (let b (read-byte))
   (if (!= b #\esc)
     (do
-      (global-set! g-input-type 0)
-      (global-set! g-input-key  b))
+      (set! g-input-type 0)
+      (set! g-input-key  b))
     ; ESC — check for sequence
     (if (! (stdin-ready))
       (do
-        (global-set! g-input-type 0)
-        (global-set! g-input-key  #\esc))
+        (set! g-input-type 0)
+        (set! g-input-key  #\esc))
       (do
         (let b2 (read-byte))
         (if (!= b2 #\[)   ; ESC + not '[' = Alt+char
           (do
-            (global-set! g-input-type 1)
-            (global-set! g-esc-p0  b2)
-            (global-set! g-esc-final 0))
+            (set! g-input-type 1)
+            (set! g-esc-p0  b2)
+            (set! g-esc-final 0))
           ; ESC [ — CSI sequence
           (do
-            (global-set! g-input-type 2)
-            (global-set! g-esc-p0 0)
-            (global-set! g-esc-p1 0)
-            (global-set! g-esc-p2 0)
-            (global-set! g-esc-p3 0)
-            (global-set! g-esc-p4 0)
-            (global-set! g-esc-p5 0)
-            (global-set! g-esc-final 0)
+            (set! g-input-type 2)
+            (set! g-esc-p0 0)
+            (set! g-esc-p1 0)
+            (set! g-esc-p2 0)
+            (set! g-esc-p3 0)
+            (set! g-esc-p4 0)
+            (set! g-esc-p5 0)
+            (set! g-esc-final 0)
             (let param-idx 0)
             (let cur-val   0)
             (let done 0)
@@ -1119,7 +1119,7 @@
                     (set! cur-val 0))
               (do
                 (set-esc-param param-idx cur-val)
-                (global-set! g-esc-final cb)
+                (set! g-esc-final cb)
                 (set! done 1))))))))))))
 
 
@@ -1153,12 +1153,12 @@
 
 (fn ed-toggle-mark ()
   (if (== g-mark -1)
-    (global-set! g-mark g-gap-start)
-    (global-set! g-mark -1)))
+    (set! g-mark g-gap-start)
+    (set! g-mark -1)))
 
 (fn ed-delete ()
   (if (!= g-mark -1)
-    (do (del-range g-mark g-gap-start) (global-set! g-mark -1))
+    (do (del-range g-mark g-gap-start) (set! g-mark -1))
     (do
       (let prev (back-char g-gap-end))
       (when (< prev g-gap-start)
@@ -1214,8 +1214,8 @@
     (inc-by! i (utf8-size (gbyte (+ g-gap-end i)))))
   (del-range g-gap-start (+ g-gap-start sel-len))
   (if keep-mark
-    (global-set! g-mark g-gap-start)
-    (global-set! g-mark -1))
+    (set! g-mark g-gap-start)
+    (set! g-mark -1))
   (when (<= num 0) (return 0))
   ; walk buffer counting newlines
   (let p 0)
@@ -1233,8 +1233,8 @@
 ; Clipboard
 ; ---------------------------------------------------------------------------
 
-(global g-copy-cmd  (alloc 64))
-(global g-paste-cmd (alloc 64))
+(global g-copy-cmd  (array-of 64))
+(global g-paste-cmd (array-of 64))
 
 (fn init-clipboard ()
   (let wayland (getenv "WAYLAND_DISPLAY"))
@@ -1268,19 +1268,19 @@
     ; Selection after cursor: physical [gap-end, gap-end + (mark - gap-start))
     (fwrite (+ g-data g-gap-end) 1 (- g-mark g-gap-start) f))
   (pclose f)
-  (global-set! g-mark -1))
+  (set! g-mark -1))
 
 (fn ed-cut ()
   (when (== g-mark -1) (return 0))
   (let saved-mark g-mark)
   (ed-copy)
   (del-range saved-mark g-gap-start)
-  (global-set! g-mark -1))
+  (set! g-mark -1))
 
 (fn ed-paste ()
   (when (!= g-mark -1)
     (del-range g-mark g-gap-start)
-    (global-set! g-mark -1))
+    (set! g-mark -1))
   (let f (popen g-paste-cmd "r"))
   (when (null? f) (return 0))
   (let buf (alloc 4096))
@@ -1318,8 +1318,8 @@
   (cpy-lit (+ cmd-buf cmd-len) " 2>&1")
   (when delete-cmd
     (del-range g-gap-start (+ g-gap-start sel-len))
-    (global-set! g-mark -1))
-  (global-set! g-mark g-gap-start)
+    (set! g-mark -1))
+  (set! g-mark g-gap-start)
   (let f (popen cmd-buf "r"))
   (when (null? f) (return 0))
   (let pipe-fd (fileno f))
@@ -1380,7 +1380,7 @@
                    (== (get p 2 1) c2)))))
 
 (fn detect-file-type (path path-len)
-  (global-set! g-file-type 0)
+  (set! g-file-type 0)
   (let i (- path-len 1))
   (while (>= i 0)
     (let b (get path i 1))
@@ -1390,29 +1390,29 @@
       ; Scheme-like: .ss .scm .sls .anc
       (when (== ext-len 2)
         (when (ext-match2 ext #\s #\s)
-          (global-set! g-file-type 1))
+          (set! g-file-type 1))
         (when (ext-match2 ext #\p #\y)
-          (global-set! g-file-type 3)))
+          (set! g-file-type 3)))
       (when (== ext-len 3)
         (when (ext-match3 ext #\s #\c #\m)
-          (global-set! g-file-type 1))
+          (set! g-file-type 1))
         (when (ext-match3 ext #\s #\l #\s)
-          (global-set! g-file-type 1))
+          (set! g-file-type 1))
         (when (ext-match3 ext #\a #\n #\c)
-          (global-set! g-file-type 1))
+          (set! g-file-type 1))
         (when (ext-match3 ext #\c #\p #\p)
-          (global-set! g-file-type 2)))
+          (set! g-file-type 2)))
       ; C-like: .c .h
       (when (== ext-len 1)
         (when (|| (== (get ext 0 1) #\c)
                   (== (get ext 0 1) #\h))
-          (global-set! g-file-type 2)))
+          (set! g-file-type 2)))
       (return 0))
     (dec! i)))
 
 (fn load-file (path path-len)
   (memcpy g-fname path path-len)
-  (global-set! g-fname-len path-len)
+  (set! g-fname-len path-len)
   (set! g-fname path-len 1 0)
   (detect-file-type path path-len)
   ; free old buffer
@@ -1423,24 +1423,24 @@
   (if (null? f)
     (do
       ; new file: empty buffer
-      (global-set! g-data (malloc INIT-GAP))
-      (global-set! g-buf-size INIT-GAP)
-      (global-set! g-gap-start 0)
-      (global-set! g-gap-end INIT-GAP))
+      (set! g-data (malloc INIT-GAP))
+      (set! g-buf-size INIT-GAP)
+      (set! g-gap-start 0)
+      (set! g-gap-end INIT-GAP))
     (do
       ; get file size, allocate gap buffer, read directly
       (fseek f 0 (c-const SEEK_END))
       (let file-size (ftell f))
       (fseek f 0 (c-const SEEK_SET))
       (let new-size (+ INIT-GAP file-size))
-      (global-set! g-data (malloc new-size))
-      (global-set! g-buf-size new-size)
-      (global-set! g-gap-start 0)
-      (global-set! g-gap-end INIT-GAP)
+      (set! g-data (malloc new-size))
+      (set! g-buf-size new-size)
+      (set! g-gap-start 0)
+      (set! g-gap-end INIT-GAP)
       (fread (+ g-data INIT-GAP) 1 file-size f)
       (fclose f)))
-  (global-set! g-view-start 0)
-  (global-set! g-mark -1))
+  (set! g-view-start 0)
+  (set! g-mark -1))
 
 ; ---------------------------------------------------------------------------
 ; Config .dylib — API accessors and plugin loading
@@ -1460,10 +1460,10 @@
 ; Buffer navigation
 (fn api-col-width      (cp) (return (col-width cp)))
 ; Mutators
-(fn api-set-tab-size   (n) (global-set! g-tab-size   n))
-(fn api-set-hl-color   (n) (global-set! g-hl-color   n))
-(fn api-set-bg-color   (n) (global-set! g-bg-color   n))
-(fn api-set-text-color (n) (global-set! g-text-color n))
+(fn api-set-tab-size   (n) (set! g-tab-size   n))
+(fn api-set-hl-color   (n) (set! g-hl-color   n))
+(fn api-set-bg-color   (n) (set! g-bg-color   n))
+(fn api-set-text-color (n) (set! g-text-color n))
 (fn api-ins-char       (cp) (return (ins-char cp)))
 (fn api-ins-spaces     (n) (ins-spaces n) (return 0))
 (fn api-gap-move       (p) (gap-move p) (return 0))
@@ -1471,12 +1471,12 @@
 (fn api-write-file     () (write-file) (return 0))
 (fn api-undo-push-ins  (n) (undo-push-insert n) (return 0))
 ; Callback registration
-(fn api-reg-draw-start (f) (global-set! g-cb-draw-start f))
-(fn api-reg-draw-char  (f) (global-set! g-cb-draw-char  f))
-(fn api-reg-draw-end   (f) (global-set! g-cb-draw-end   f))
-(fn api-reg-on-key     (f) (global-set! g-cb-on-key     f))
-(fn api-reg-on-newline (f) (global-set! g-cb-on-newline f))
-(fn api-reg-compute-vs (f) (global-set! g-cb-compute-vs f))
+(fn api-reg-draw-start (f) (set! g-cb-draw-start f))
+(fn api-reg-draw-char  (f) (set! g-cb-draw-char  f))
+(fn api-reg-draw-end   (f) (set! g-cb-draw-end   f))
+(fn api-reg-on-key     (f) (set! g-cb-on-key     f))
+(fn api-reg-on-newline (f) (set! g-cb-on-newline f))
+(fn api-reg-compute-vs (f) (set! g-cb-compute-vs f))
 
 (fn load-config ()
   ; Build path ~/.config/buged/config.dylib
@@ -1489,7 +1489,7 @@
   ; Try dlopen
   (let handle (dlopen path-buf (bor (c-const RTLD_LAZY) (c-const RTLD_LOCAL))))
   (when (null? handle) (return 0))
-  (global-set! g-config-handle handle)
+  (set! g-config-handle handle)
   ; Fill EditorAPI struct from define-api mapping
   (populate-EditorAPI g-config-api)
   ; Call buged_init
@@ -1509,7 +1509,7 @@
   ; Scroll wheel up — view moves earlier (1 line, matching Scheme ref)
   (when (== btn 64)
     (let new-vs (move-up (cwgs g-view-start)))
-    (global-set! g-view-start (bound-idx new-vs))
+    (set! g-view-start (bound-idx new-vs))
     ; Walk to screen bottom; if cursor is at/past one line above it, pull cursor up
     ; This matches Scheme: curs-yx to find bottom pos, then move-up from there
     (let i (cwgs g-view-start)) (let vrow 0) (let vcol 0)
@@ -1535,7 +1535,7 @@
       ; Recompute vs-phys: g-view-start (logical) unchanged, gap moved forward
       (set! vs-phys (cwgs g-view-start))
       (set! new-vs (move-down vs-phys)))
-    (global-set! g-view-start (bound-idx new-vs))
+    (set! g-view-start (bound-idx new-vs))
     (return 0))
   ; Mouse drag (btn=32): move cursor, keep mark
   (when (== btn 32)
@@ -1545,15 +1545,15 @@
   (when (== btn 0)
     (when press
       (gap-move (screen-to-pos row col))
-      (global-set! g-mark g-gap-start)
-      (global-set! g-clicked-y row)
-      (global-set! g-clicked-x col))
+      (set! g-mark g-gap-start)
+      (set! g-clicked-y row)
+      (set! g-clicked-x col))
     (when (! press)
       ; release at same position as click = tap → clear mark
       (when (&& (== row g-clicked-y) (== col g-clicked-x))
-        (global-set! g-mark -1))
-      (global-set! g-clicked-y -1)
-      (global-set! g-clicked-x -1)))
+        (set! g-mark -1))
+      (set! g-clicked-y -1)
+      (set! g-clicked-x -1)))
   (return 0))
 
 ; Returns 1 if input was handled, 2 if quit, 3 if suspend
@@ -1651,7 +1651,7 @@
 ; ---------------------------------------------------------------------------
 
 (fn endwin ()
-  (global-set! g-out-len 0)
+  (set! g-out-len 0)
   (mouse-off)
   (screen-alt-off)
   (term-raw-off)
@@ -1665,10 +1665,10 @@
   (setlocale (c-const LC_ALL) "en_US.UTF-8")
 
   ; Init gap buffer for empty file
-  (global-set! g-data (malloc INIT-GAP))
-  (global-set! g-buf-size  INIT-GAP)
-  (global-set! g-gap-start 0)
-  (global-set! g-gap-end   INIT-GAP)
+  (set! g-data (malloc INIT-GAP))
+  (set! g-buf-size  INIT-GAP)
+  (set! g-gap-start 0)
+  (set! g-gap-end   INIT-GAP)
 
   ; Init clipboard
   (init-clipboard)
@@ -1706,7 +1706,7 @@
 
       ; Handle pending resize
       (when g-resized
-        (global-set! g-resized 0)
+        (set! g-resized 0)
         (term-get-size)
         (check-view))
 
