@@ -62,16 +62,10 @@
 ; Macros
 ; ---------------------------------------------------------------------------
 
-(define-syntax when
-  (syntax-rules () [(_ c b ...) (if c (do b ...))]))
-
 ; str-eq-lit: (str-eq-lit len "word") → (str-eq-lit len "word")
 (define-syntax str-eq-lit
   (macro-case ()
     [(_ len s) `(str-eq ,len ,s ,(string-length s))]))
-
-(define-syntax unless
-  (syntax-rules () [(_ c b ...) (if (! c) (do b ...))]))
 
 (define-syntax inc!
   (syntax-rules () [(_ x) (set! x (+ x 1))]))
@@ -553,12 +547,12 @@
 (fn cp-get (idx)
   (let off (* idx 8))
   (let addr (+ g-cp-states off))
-  (return (get addr 0 8)))
+  (return (get addr 0)))
 
 (fn cp-set (idx val)
   (let off (* idx 8))
   (let addr (+ g-cp-states off))
-  (set! addr 0 8 val))
+  (set! addr 0 val))
 
 ; Scan state — shared by vs-scan-cp/phys-to-log/log-to-phys
 ; (globals to stay under Anchor's ~5 param limit per function)

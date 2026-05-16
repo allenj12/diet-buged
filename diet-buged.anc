@@ -38,12 +38,6 @@
   (macro-case ()
     [(_ dst s) `(memcpy ,dst ,s ,(+ (string-length s) 1))]))
 
-(define-syntax when
-  (syntax-rules () [(_ c b ...) (if c (do b ...))]))
-
-(define-syntax unless
-  (syntax-rules () [(_ c b ...) (if (! c) (do b ...))]))
-
 (define-syntax inc!
   (syntax-rules () [(_ x) (set! x (+ x 1))]))
 
@@ -472,47 +466,52 @@
 
 ; Number of bytes in the UTF-8 char starting with byte b
 (fn utf8-size (b)
-  (return (if (== (band b 0x80) 0)    1
-          (if (== (band b 0xE0) 0xC0) 2
-          (if (== (band b 0xF0) 0xE0) 3
-                                       4)))))
+  (cond
+    [(== (band b 0x80) 0)    (return 1)]
+    [(== (band b 0xE0) 0xC0) (return 2)]
+    [(== (band b 0xF0) 0xE0) (return 3)]
+    [else                     (return 4)]))
 
 ; Read codepoint at physical position i; return codepoint
 (fn utf8-ref-phys (i)
   (let b (gbyte i))
-  (return (if (== (band b 0x80) 0)
-    b
-  (if (== (band b 0xE0) 0xC0)
-    (bor (lshift (band b 0x1F) 6)
-         (band (gbyte (+ i 1)) 0x3F))
-  (if (== (band b 0xF0) 0xE0)
-    (bor (lshift (band b 0x0F) 12)
-    (bor (lshift (band (gbyte (+ i 1)) 0x3F) 6)
-         (band (gbyte (+ i 2)) 0x3F)))
-  ; 4-byte
-  (bor (lshift (band b 0x07) 18)
-  (bor (lshift (band (gbyte (+ i 1)) 0x3F) 12)
-  (bor (lshift (band (gbyte (+ i 2)) 0x3F) 6)
-       (band (gbyte (+ i 3)) 0x3F)))))))))
+  (cond
+    [(== (band b 0x80) 0)
+     (return b)]
+    [(== (band b 0xE0) 0xC0)
+     (return (bor (lshift (band b 0x1F) 6)
+                  (band (gbyte (+ i 1)) 0x3F)))]
+    [(== (band b 0xF0) 0xE0)
+     (return (bor (lshift (band b 0x0F) 12)
+             (bor (lshift (band (gbyte (+ i 1)) 0x3F) 6)
+                  (band (gbyte (+ i 2)) 0x3F))))]
+    [else
+     (return (bor (lshift (band b 0x07) 18)
+             (bor (lshift (band (gbyte (+ i 1)) 0x3F) 12)
+             (bor (lshift (band (gbyte (+ i 2)) 0x3F) 6)
+                  (band (gbyte (+ i 3)) 0x3F)))))]))
 
 ; Write codepoint cp at physical position i; return bytes written
 (fn utf8-write-phys (i cp)
-  (if (< cp 0x80)
-    (do (gbyte! i cp) (return 1))
-  (if (< cp 0x800)
-    (do (gbyte! i      (bor 0xC0 (rshift cp 6)))
-        (gbyte! (+ i 1) (bor 0x80 (band cp 0x3F)))
-        (return 2))
-  (if (< cp 0x10000)
-    (do (gbyte! i      (bor 0xE0 (rshift cp 12)))
-        (gbyte! (+ i 1) (bor 0x80 (band (rshift cp 6) 0x3F)))
-        (gbyte! (+ i 2) (bor 0x80 (band cp 0x3F)))
-        (return 3))
-  (do   (gbyte! i      (bor 0xF0 (rshift cp 18)))
-        (gbyte! (+ i 1) (bor 0x80 (band (rshift cp 12) 0x3F)))
-        (gbyte! (+ i 2) (bor 0x80 (band (rshift cp 6) 0x3F)))
-        (gbyte! (+ i 3) (bor 0x80 (band cp 0x3F)))
-        (return 4))))))
+  (cond
+    [(< cp 0x80)
+     (gbyte! i cp)
+     (return 1)]
+    [(< cp 0x800)
+     (gbyte! i      (bor 0xC0 (rshift cp 6)))
+     (gbyte! (+ i 1) (bor 0x80 (band cp 0x3F)))
+     (return 2)]
+    [(< cp 0x10000)
+     (gbyte! i      (bor 0xE0 (rshift cp 12)))
+     (gbyte! (+ i 1) (bor 0x80 (band (rshift cp 6) 0x3F)))
+     (gbyte! (+ i 2) (bor 0x80 (band cp 0x3F)))
+     (return 3)]
+    [else
+     (gbyte! i      (bor 0xF0 (rshift cp 18)))
+     (gbyte! (+ i 1) (bor 0x80 (band (rshift cp 12) 0x3F)))
+     (gbyte! (+ i 2) (bor 0x80 (band (rshift cp 6) 0x3F)))
+     (gbyte! (+ i 3) (bor 0x80 (band cp 0x3F)))
+     (return 4)]))
 
 
 ; Display width of codepoint cp (tab = tab-size spaces)
@@ -926,7 +925,7 @@
       (out-byte (bor 0x80 (band cp 0x3F))))))))
 
 (fn fill-spaces (n)
-  (let i 0) (while (< i n) (out-byte #\space) (inc! i)))
+  (for range (i n) (out-byte #\space)))
 
 ; Is physical position pos within selection? Mark is a logical position.
 (fn in-selection (pos)
@@ -1171,8 +1170,7 @@
     (inc-by! g-gap-end (utf8-size (gbyte g-gap-end)))))
 
 (fn ins-spaces (n)
-  (let i 0)
-  (while (< i n) (ins-char #\space) (undo-push-insert 1) (inc! i)))
+  (for range (i n) (ins-char #\space) (undo-push-insert 1)))
 
 ; Insert codepoint with undo tracking
 (fn ed-insert (cp)
