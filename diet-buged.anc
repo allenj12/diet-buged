@@ -1689,9 +1689,8 @@
 
   ; Load file from argv[1] if present
   (when (> argc 1)
-    (let path (get argv 8 8))  ; argv[1] = *(argv+8)
-    (let path-ptr (cast char* path))
-    (load-file path-ptr (strlen path-ptr)))
+    (let path (get argv 8))  ; argv[1] = *(argv+8)
+    (load-file path (strlen path)))
 
   ; Load config .so
   (with-arena (kb 1)
