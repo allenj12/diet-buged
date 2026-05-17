@@ -671,10 +671,11 @@
   (set! g-vs-gs (api get-gap-start))
   (set! g-vs-ge (api get-gap-end))
 
-  ; Invalidate checkpoints only when content changes (buf-size changes)
-  (when (!= g-cp-bs bs)
+  ; Invalidate checkpoints when content changes (logical size changes on any edit)
+  (let content-sz (- bs (- g-vs-ge g-vs-gs)))
+  (when (!= g-cp-bs content-sz)
     (set! g-cp-high -1)
-    (set! g-cp-bs bs))
+    (set! g-cp-bs content-sz))
 
   ; Convert vsphys to logical for checkpoint lookup
   (let vs-log (phys-to-log vsphys))
