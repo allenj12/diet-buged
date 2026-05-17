@@ -736,11 +736,7 @@
 (fn del-back ()
   (let prev (back-char g-gap-end))
   (when (>= prev g-gap-start) (return g-gap-start))
-  (let sz (- g-gap-start prev))
-  ; save bytes for undo (type=1: was-delete, undo by inserting)
-  (undo-push-delete prev sz)
-  ; expand gap leftward
-  (dec-by! g-gap-start sz)
+  (del-range prev g-gap-start)
   (return g-gap-start))
 
 ; Delete a selection from lo to hi (logical positions)
@@ -1161,8 +1157,7 @@
     (do
       (let prev (back-char g-gap-end))
       (when (< prev g-gap-start)
-        (undo-push-delete prev (- g-gap-start prev))
-        (dec-by! g-gap-start (- g-gap-start prev))))))
+        (del-range prev g-gap-start)))))
 
 (fn ed-delete-fwd ()
   (when (< g-gap-end g-buf-size)
